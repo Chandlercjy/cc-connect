@@ -401,8 +401,21 @@ func (p *Platform) prepareOrdinaryPostContent(ctx context.Context, markdown stri
 	return resolvedText, images
 }
 
+func ordinaryPreviewContentBeforeTable(content string) (string, bool) {
+	matches := findMarkdownTablesOutsideCodeBlocks(content)
+	if len(matches) == 0 {
+		return content, false
+	}
+	prefix := strings.TrimRight(content[:matches[0].start], "\n")
+	if strings.TrimSpace(prefix) == "" {
+		return "…", true
+	}
+	return prefix, true
+}
+
 func (p *Platform) sendOrdinaryPreviewStart(ctx context.Context, rc replyContext, content string) (any, error) {
-	prepared, _ := p.prepareOrdinaryPostContent(ctx, content, false)
+	previewContent, tableBuffered := ordinaryPreviewContentBeforeTable(content)
+	prepared, _ := p.prepareOrdinaryPostContent(ctx, previewContent, false)
 	msgType := larkim.MsgTypePost
 	body := buildOrdinaryPostJSON(prepared, nil)
 	requestUUID := uuid.NewString()
@@ -465,15 +478,32 @@ func (p *Platform) sendOrdinaryPreviewStart(ctx context.Context, rc replyContext
 		return nil, fmt.Errorf("%s: send ordinary preview: no message ID returned", p.tag())
 	}
 	return &feishuPreviewHandle{
-		kind:        feishuPreviewKindOrdinary,
-		messageID:   msgID,
-		chatID:      rc.chatID,
-		msgType:     msgType,
-		lastContent: content,
+		kind:                  feishuPreviewKindOrdinary,
+		messageID:             msgID,
+		chatID:                rc.chatID,
+		msgType:               msgType,
+		lastContent:           content,
+		ordinaryTableBuffered: tableBuffered,
 	}, nil
 }
 
 func (p *Platform) updateOrdinaryPreview(ctx context.Context, h *feishuPreviewHandle, content string, final bool) error {
+	if !final {
+		if prefix, hasTable := ordinaryPreviewContentBeforeTable(content); hasTable {
+			h.mu.Lock()
+			alreadyBuffered := h.ordinaryTableBuffered
+			h.ordinaryTableBuffered = true
+			h.lastContent = content
+			h.mu.Unlock()
+			if alreadyBuffered {
+				return nil
+			}
+
+			prepared, _ := p.prepareOrdinaryPostContent(ctx, prefix, false)
+			body := buildOrdinaryPostJSON(prepared, nil)
+			return p.updateOrdinaryPreviewPost(ctx, h, body, content, false)
+		}
+	}
 	prepared, _ := p.prepareOrdinaryPostContent(ctx, content, false)
 	body := buildOrdinaryPostJSON(prepared, nil)
 	return p.updateOrdinaryPreviewPost(ctx, h, body, content, final)

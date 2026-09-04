@@ -4545,6 +4545,7 @@ type feishuPreviewHandle struct {
 	status                 core.CardStatus
 	lastContent            string
 	ordinarySuccessfulPUTs int
+	ordinaryTableBuffered  bool
 	ordinaryFinalizing     chan struct{}
 	ordinaryFinalized      bool
 	ordinaryFinalizeErr    error

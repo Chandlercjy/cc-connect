@@ -412,6 +412,102 @@ func TestHermesOrdinaryPreviewStartsAsPostAndUsesPUT(t *testing.T) {
 	}
 }
 
+func TestHermesOrdinaryTableFreezesAfterPrefixAndFinalizesInOriginalPost(t *testing.T) {
+	recorder := &ordinaryMessageRecorder{}
+	p, closeServer := newOrdinaryMessageTestPlatform(t, true, recorder)
+	defer closeServer()
+
+	rctx := replyContext{messageID: "om_trigger", chatID: "oc_chat"}
+	handleAny, err := p.SendPreviewStart(context.Background(), rctx, "Intro par")
+	if err != nil {
+		t.Fatalf("SendPreviewStart() error = %v", err)
+	}
+	table := "Intro paragraph complete.\n\n| Name | Value |\n|---|---|\n| alpha | 1 |"
+	if err := p.UpdateMessage(context.Background(), handleAny, table); err != nil {
+		t.Fatalf("UpdateMessage(table) error = %v", err)
+	}
+	if err := p.UpdateMessage(context.Background(), handleAny, table+"\n| beta | 2 |"); err != nil {
+		t.Fatalf("UpdateMessage(table extension) error = %v", err)
+	}
+	final := table + "\n| beta | 2 |\n\nDone."
+	handled, err := p.FinalizePreview(context.Background(), rctx, handleAny, final, "model · ctx")
+	if err != nil || !handled {
+		t.Fatalf("FinalizePreview() = handled %v err %v", handled, err)
+	}
+
+	requests := recorder.snapshot()
+	var putBodies []string
+	var freshPostCount, deleteCount int
+	for i, req := range requests {
+		switch {
+		case req.method == http.MethodPut:
+			putBodies = append(putBodies, postMarkdownText(t, req.content))
+		case i > 0 && req.method == http.MethodPost:
+			freshPostCount++
+		case req.method == http.MethodDelete:
+			deleteCount++
+		}
+	}
+	if len(putBodies) != 2 {
+		t.Fatalf("table PUT count = %d, want prefix + final PUT; requests=%#v", len(putBodies), requests)
+	}
+	if putBodies[0] != "Intro paragraph complete." || strings.Contains(putBodies[0], "| Name |") {
+		t.Fatalf("prefix PUT = %q, want complete table-free prefix", putBodies[0])
+	}
+	if !strings.Contains(putBodies[1], final) || !strings.Contains(putBodies[1], "model · ctx") {
+		t.Fatalf("final PUT = %q, want complete table and footer", putBodies[1])
+	}
+	if freshPostCount != 0 || deleteCount != 0 {
+		t.Fatalf("fresh posts=%d deletes=%d, want original preview updated without recall; requests=%#v", freshPostCount, deleteCount, requests)
+	}
+}
+
+func TestHermesOrdinaryTableInFirstFrameUsesPlaceholderThenFinalPUT(t *testing.T) {
+	recorder := &ordinaryMessageRecorder{}
+	p, closeServer := newOrdinaryMessageTestPlatform(t, true, recorder)
+	defer closeServer()
+
+	rctx := replyContext{messageID: "om_trigger", chatID: "oc_chat"}
+	table := "| Name | Value |\n|---|---|\n| alpha | 1 |"
+	handleAny, err := p.SendPreviewStart(context.Background(), rctx, table)
+	if err != nil {
+		t.Fatalf("SendPreviewStart(table) error = %v", err)
+	}
+	handle := handleAny.(*feishuPreviewHandle)
+	if !handle.ordinaryTableBuffered {
+		t.Fatal("table in first frame should mark preview as locally buffered")
+	}
+	requests := recorder.snapshot()
+	if len(requests) != 1 || strings.Contains(postMarkdownText(t, requests[0].content), "| Name |") {
+		t.Fatalf("first table frame should send a table-free placeholder: %#v", requests)
+	}
+
+	handled, err := p.FinalizePreview(context.Background(), rctx, handle, table, "")
+	if err != nil || !handled {
+		t.Fatalf("FinalizePreview() = handled %v err %v", handled, err)
+	}
+	requests = recorder.snapshot()
+	var putBodies []string
+	var freshPostCount, deleteCount int
+	for i, req := range requests {
+		if req.method == http.MethodPut {
+			putBodies = append(putBodies, postMarkdownText(t, req.content))
+		}
+		if i > 0 && req.method == http.MethodPost {
+			freshPostCount++
+		}
+		if req.method == http.MethodDelete {
+			deleteCount++
+		}
+	}
+	if len(putBodies) != 1 || !strings.Contains(putBodies[0], "| alpha | 1 |") {
+		t.Fatalf("final PUT bodies=%v, want one complete table update", putBodies)
+	}
+	if freshPostCount != 0 || deleteCount != 0 {
+		t.Fatalf("fresh posts=%d deletes=%d, want original placeholder updated without recall; requests=%#v", freshPostCount, deleteCount, requests)
+	}
+}
+
 func TestHermesOrdinaryPOSTRequestUUIDIsPresentAndStableAcrossRetry(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
