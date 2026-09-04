@@ -454,8 +454,10 @@ const (
 	MsgAskQuestionNote      MsgKey = "ask_question_note"
 	MsgAskQuestionNoteMulti MsgKey = "ask_question_note_multi"
 	MsgAskQuestionMulti     MsgKey = "ask_question_multi"
-	MsgAskQuestionPrompt    MsgKey = "ask_question_prompt"
-	MsgAskQuestionAnswered  MsgKey = "ask_question_answered"
+	MsgAskQuestionPrompt        MsgKey = "ask_question_prompt"
+	MsgAskQuestionAnswered      MsgKey = "ask_question_answered"
+	MsgAskQuestionMultiCardNote MsgKey = "ask_question_multi_card_note"
+	MsgAskQuestionSubmit        MsgKey = "ask_question_submit"
 
 	MsgCommandsTitle        MsgKey = "commands_title"
 	MsgCommandsEmpty        MsgKey = "commands_empty"
@@ -692,6 +694,11 @@ const (
 	MsgAgentCronToolPrompt MsgKey = "agent_cron_tool_prompt"
 	MsgAgentTimerToolPrompt MsgKey = "agent_timer_tool_prompt"
 	MsgAgentRelayToolPrompt MsgKey = "agent_relay_tool_prompt"
+)
+
+const (
+	MsgAskQuestionChoiceNote MsgKey = "ask_question_choice_note"
+	MsgAskQuestionInputNote  MsgKey = "ask_question_input_note"
 )
 
 var messages = map[MsgKey]map[Language]string{
@@ -2780,12 +2787,40 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "ボタンが反応しない場合は、番号（例: 1）で返信するか、直接回答を入力してください",
 		LangSpanish:            "Si los botones no responden, responda con el número de opción (ej. 1) o escriba su respuesta",
 	},
+	MsgAskQuestionChoiceNote: {
+		LangEnglish:            "Tap an option to select it. If it is unresponsive, reply with the option number (e.g. 1) or type your answer",
+		LangChinese:            "点击选项即可选择；如果无响应，请回复选项编号（如 1）或直接输入你的回答",
+		LangTraditionalChinese: "點擊選項即可選擇；若無回應，請回覆選項編號（如 1）或直接輸入你的回答",
+		LangJapanese:           "選択肢をタップして選択できます。反応しない場合は、番号（例: 1）で返信するか、直接回答を入力してください",
+		LangSpanish:            "Toque una opción para seleccionarla. Si no responde, responda con el número (ej. 1) o escriba su respuesta",
+	},
+	MsgAskQuestionInputNote: {
+		LangEnglish:            "Reply to this message with your answer; do not approve it as a permission request",
+		LangChinese:            "请直接回复这条消息并输入你的答案；这不是权限审批",
+		LangTraditionalChinese: "請直接回覆這則訊息並輸入你的答案；這不是權限審批",
+		LangJapanese:           "このメッセージに回答を直接返信してください。これは権限承認ではありません",
+		LangSpanish:            "Responda directamente a este mensaje con su respuesta; no es una solicitud de permiso",
+	},
 	MsgAskQuestionNoteMulti: {
 		LangEnglish:            "Reply with comma-separated option numbers (e.g. 1,3) or type your answer",
 		LangChinese:            "请回复逗号分隔的选项编号（如 1,3）或直接输入你的回答",
 		LangTraditionalChinese: "請回覆逗號分隔的選項編號（如 1,3）或直接輸入你的回答",
 		LangJapanese:           "カンマ区切りの番号（例: 1,3）で返信するか、直接回答を入力してください",
 		LangSpanish:            "Responda con los números de opción separados por comas (ej. 1,3) o escriba su respuesta",
+	},
+	MsgAskQuestionMultiCardNote: {
+		LangEnglish:            "Select all that apply, then tap Confirm selection. For a custom answer, reply with text instead.",
+		LangChinese:            "勾选所有适用项后点击“确认选择”；如需自定义回答，请直接回复文字。",
+		LangTraditionalChinese: "勾選所有適用項後點擊「確認選擇」；如需自訂回答，請直接回覆文字。",
+		LangJapanese:           "該当する項目をすべて選び、「選択を確定」をタップしてください。自由回答はテキストで返信できます。",
+		LangSpanish:            "Seleccione todas las opciones aplicables y toque Confirmar selección. Para una respuesta personalizada, responda con texto.",
+	},
+	MsgAskQuestionSubmit: {
+		LangEnglish:            "Confirm selection",
+		LangChinese:            "确认选择",
+		LangTraditionalChinese: "確認選擇",
+		LangJapanese:           "選択を確定",
+		LangSpanish:            "Confirmar selección",
 	},
 	MsgAskQuestionMulti: {
 		LangEnglish:            " (multiple selections allowed, separate with commas)",

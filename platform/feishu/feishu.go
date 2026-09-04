@@ -176,6 +176,8 @@ type Platform struct {
 	// session key, enabling async card refreshes via the Patch API.
 	cardActionMsgMu  sync.Mutex
 	cardActionMsgIDs map[string]string // sessionKey → messageID
+	choiceCardMu     sync.Mutex
+	choiceCards      map[string]*choiceCardState // card nonce → immutable options + first selection
 	// activeThreadSessions tracks thread sessionKeys that have already been
 	// accepted by the bot. In group chats with thread_isolation, once a thread
 	// has been engaged (the first @bot message), subsequent attachment-only
@@ -797,11 +799,22 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 		actionVal = event.Event.Action.Option
 	}
 	if actionVal == "" {
-		switch event.Event.Action.Name {
-		case "delete_mode_submit":
-			actionVal = "act:/delete-mode form-submit"
-		case "delete_mode_cancel":
-			actionVal = "act:/delete-mode cancel"
+		if action, cardID, ok := parseAskQuestionSubmitName(event.Event.Action.Name); ok {
+			actionVal = action
+			if event.Event.Action.Value == nil {
+				event.Event.Action.Value = make(map[string]any)
+			}
+			event.Event.Action.Value[choiceCardIDKey] = cardID
+			if sessionKey := p.choiceCardSessionKey(cardID); sessionKey != "" {
+				event.Event.Action.Value["session_key"] = sessionKey
+			}
+		} else {
+			switch event.Event.Action.Name {
+			case "delete_mode_submit":
+				actionVal = "act:/delete-mode form-submit"
+			case "delete_mode_cancel":
+				actionVal = "act:/delete-mode cancel"
+			}
 		}
 	}
 	if actionVal == "act:/delete-mode form-submit" {
@@ -809,6 +822,13 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 		if len(ids) > 0 {
 			actionVal += " " + strings.Join(ids, ",")
 		}
+	}
+	if strings.HasPrefix(actionVal, "askq:") && strings.HasSuffix(actionVal, ":multi") {
+		values := collectAskQuestionValuesFromForm(event.Event.Action.FormValue)
+		// An empty committed selection is valid in Pi's questionnaire contract.
+		// Preserve the trailing colon so extensionInputAnswer can distinguish it
+		// from an unsubmitted form action.
+		actionVal += ":" + strings.Join(values, ",")
 	}
 
 	userID := ""
@@ -934,33 +954,53 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 		}, nil
 	}
 
-	// askq: — AskUserQuestion option selected, forward as user message
+	// askq: — AskUserQuestion option selected, forward the first selection as
+	// a user message and replace the card with an immutable result. The tracked
+	// snapshot keeps every original option visible in chat history.
 	if strings.HasPrefix(actionVal, "askq:") {
-		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
-		go p.dispatchCoreMessage(&core.Message{
-			SessionKey: sessionKey,
-			Platform:   p.platformName,
-			UserID:     userID,
-			UserName:   p.resolveUserName(userID),
-			ChatName:   p.resolveChatName(chatID),
-			Content:    actionVal,
-			ReplyCtx:   rctx,
-		})
+		cardID, _ := event.Event.Action.Value[choiceCardIDKey].(string)
+		snapshot, selectedAction, accepted := p.selectChoiceCard(cardID, actionVal)
 
 		answerLabel, _ := event.Event.Action.Value["askq_label"].(string)
 		askqQuestion, _ := event.Event.Action.Value["askq_question"].(string)
+		answeredLabel, _ := event.Event.Action.Value["askq_answered"].(string)
+		requestID, _ := event.Event.Action.Value["askq_request_id"].(string)
+		storedQuestion, storedAnswer, storedAnsweredLabel, storedRequestID := choiceMetadata(snapshot, selectedAction)
+		if storedQuestion != "" {
+			askqQuestion = storedQuestion
+		}
+		if storedAnswer != "" {
+			answerLabel = storedAnswer
+		}
+		if storedAnsweredLabel != "" {
+			answeredLabel = storedAnsweredLabel
+		}
+		if storedRequestID != "" {
+			requestID = storedRequestID
+		}
 		if answerLabel == "" {
-			answerLabel = actionVal
+			answerLabel = selectedAction
 		}
-		cb := core.NewCard().Title("✅ "+answerLabel, "green")
-		if askqQuestion != "" {
-			cb.Markdown(askqQuestion)
+
+		if accepted {
+			rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
+			go p.dispatchCoreMessage(&core.Message{
+				SessionKey:           sessionKey,
+				Platform:             p.platformName,
+				UserID:               userID,
+				UserName:             p.resolveUserName(userID),
+				ChatName:             p.resolveChatName(chatID),
+				Content:              selectedAction,
+				ReplyCtx:             rctx,
+				IsPermissionResponse: true,
+				PermissionRequestID:  requestID,
+			})
 		}
-		cb.Markdown("**→ " + answerLabel + "**")
+
 		return &callback.CardActionTriggerResponse{
 			Card: &callback.Card{
 				Type: "raw",
-				Data: renderCardMap(cb.Build(), sessionKey),
+				Data: renderAnsweredChoiceCardMap(snapshot, selectedAction, askqQuestion, answerLabel, answeredLabel),
 			},
 		}, nil
 	}

@@ -363,6 +363,217 @@ func TestInteractivePlatform_CardActionPassesCardSenderToHandler(t *testing.T) {
 	}
 }
 
+func TestInteractivePlatform_AskQuestionChoiceBecomesNonInteractiveCard2(t *testing.T) {
+	platformAny, err := New(map[string]any{"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": true})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ip := platformAny.(*interactivePlatform)
+	msgCh := make(chan *core.Message, 2)
+	ip.handler = func(_ core.Platform, msg *core.Message) { msgCh <- msg }
+
+	firstLabel := strings.Repeat("First long option ", 8)
+	secondLabel := strings.Repeat("Selected long option ", 8)
+	prepared, cardID := ip.prepareChoiceCard(core.NewCard().
+		Title("Agent Question", "blue").
+		Markdown("**Choose an implementation**").
+		Choice("**1. "+firstLabel+"**\nFirst explanation", firstLabel, "askq:0:1", map[string]string{
+			"askq_label": firstLabel, "askq_answered": "Answered", "askq_request_id": "request-single-1",
+		}).
+		Choice("**2. "+secondLabel+"**\nSecond explanation", secondLabel, "askq:0:2", map[string]string{
+			"askq_label": secondLabel, "askq_answered": "Answered", "askq_request_id": "request-single-1",
+		}).
+		Build())
+	if cardID == "" {
+		t.Fatal("choice card was not assigned a tracking ID")
+	}
+	outgoing, err := json.Marshal(renderCardMap(prepared, "feishu:test-session"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(outgoing), cardID) {
+		t.Fatalf("outgoing choice callbacks do not carry tracking ID: %s", outgoing)
+	}
+
+	event := &callback.CardActionTriggerEvent{
+		Event: &callback.CardActionTriggerRequest{
+			Operator: &callback.Operator{OpenID: "ou_test_user"},
+			Action: &callback.CallBackAction{
+				Tag: "interactive_container",
+				Value: map[string]any{
+					"action":        "askq:0:2",
+					"session_key":   "feishu:test-session",
+					choiceCardIDKey: cardID,
+					"askq_label":    secondLabel,
+					"askq_question": "Choose an implementation",
+					"askq_answered": "Answered",
+				},
+			},
+			Context: &callback.Context{OpenChatID: "oc_test_chat", OpenMessageID: "om_test_message"},
+		},
+	}
+	resp, err := ip.onCardAction(event)
+	if err != nil {
+		t.Fatalf("onCardAction() error = %v", err)
+	}
+	if resp == nil || resp.Card == nil || resp.Card.Type != "raw" {
+		t.Fatalf("response card = %#v, want raw replacement", resp)
+	}
+	data, ok := resp.Card.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("response data = %T, want map", resp.Card.Data)
+	}
+	if data["schema"] != "2.0" {
+		t.Fatalf("response schema = %#v, want Card 2.0", data["schema"])
+	}
+	raw, err := json.Marshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{`"behaviors"`, `"interactive_container"`, `"tag":"button"`, `"askq:0:`} {
+		if strings.Contains(string(raw), forbidden) {
+			t.Fatalf("answered card remains interactive (%s): %s", forbidden, raw)
+		}
+	}
+	if !strings.Contains(string(raw), firstLabel) || !strings.Contains(string(raw), secondLabel) {
+		t.Fatalf("answered card did not retain every original option: %s", raw)
+	}
+	if !strings.Contains(string(raw), "✅ **2. "+secondLabel) || !strings.Contains(string(raw), "Answered") {
+		t.Fatalf("answered card does not mark the selected option: %s", raw)
+	}
+
+	select {
+	case msg := <-msgCh:
+		if msg.Content != "askq:0:2" || !msg.IsPermissionResponse || msg.PermissionRequestID != "request-single-1" {
+			t.Fatalf("dispatched message = %#v", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ask question choice was not dispatched")
+	}
+
+	// A stale or double-tap callback redraws the same immutable result but must
+	// not send a second answer to the engine.
+	if _, err := ip.onCardAction(event); err != nil {
+		t.Fatalf("duplicate onCardAction() error = %v", err)
+	}
+	select {
+	case duplicate := <-msgCh:
+		t.Fatalf("duplicate choice was dispatched: %#v", duplicate)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestInteractivePlatform_AskQuestionMultiSelectSubmitsOnceAndFreezesCard(t *testing.T) {
+	platformAny, err := New(map[string]any{"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": true})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ip := platformAny.(*interactivePlatform)
+	msgCh := make(chan *core.Message, 2)
+	ip.handler = func(_ core.Platform, msg *core.Message) { msgCh <- msg }
+
+	prepared, cardID := ip.prepareChoiceCardForSession(core.NewCard().
+		Title("Agent Question", "blue").
+		Markdown("**Choose fruits**").
+		MultiSelect([]core.CardMultiSelectOption{
+			{Text: "**1. Apple**\nKeeps well", Value: "1"},
+			{Text: "**2. Banana**\nGood for breakfast", Value: "2"},
+			{Text: "**3. Orange**\nGood for juice", Value: "3"},
+		}, "Confirm selection", "askq:0:multi", map[string]string{
+			"askq_question": "Choose fruits", "askq_answered": "Answered", "askq_request_id": "request-multi-1",
+		}).
+		Build(), "feishu:test-session")
+	if cardID == "" {
+		t.Fatal("multi-select card was not assigned a tracking ID")
+	}
+	outgoing, err := json.Marshal(renderCardMap(prepared, "feishu:test-session"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(outgoing), cardID) {
+		t.Fatalf("outgoing submit callback does not carry tracking ID: %s", outgoing)
+	}
+
+	event := &callback.CardActionTriggerEvent{
+		Event: &callback.CardActionTriggerRequest{
+			Operator: &callback.Operator{OpenID: "ou_test_user"},
+			Action: &callback.CallBackAction{
+				Tag:  "button",
+				Name: askQuestionSubmitName("askq:0:multi", cardID),
+				FormValue: map[string]any{
+					askQuestionCheckerName("3"): true,
+					askQuestionCheckerName("1"): true,
+					askQuestionCheckerName("2"): false,
+				},
+			},
+			Context: &callback.Context{OpenChatID: "oc_test_chat", OpenMessageID: "om_test_message"},
+		},
+	}
+	resp, err := ip.onCardAction(event)
+	if err != nil {
+		t.Fatalf("onCardAction() error = %v", err)
+	}
+	if resp == nil || resp.Card == nil || resp.Card.Type != "raw" {
+		t.Fatalf("response card = %#v, want immutable raw replacement", resp)
+	}
+	raw, err := json.Marshal(resp.Card.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{`"behaviors"`, `"tag":"checker"`, `"tag":"form"`, `"tag":"button"`, `"askq:0:`} {
+		if strings.Contains(string(raw), forbidden) {
+			t.Fatalf("answered multi-select card remains interactive (%s): %s", forbidden, raw)
+		}
+	}
+	for _, want := range []string{"✅ **1. Apple", "☐ **2. Banana", "✅ **3. Orange", "Answered"} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("answered card missing %q: %s", want, raw)
+		}
+	}
+
+	select {
+	case msg := <-msgCh:
+		if msg.Content != "askq:0:multi:1,3" || !msg.IsPermissionResponse || msg.PermissionRequestID != "request-multi-1" {
+			t.Fatalf("dispatched message = %#v", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("multi-select submission was not dispatched")
+	}
+
+	if _, err := ip.onCardAction(event); err != nil {
+		t.Fatalf("duplicate onCardAction() error = %v", err)
+	}
+	select {
+	case duplicate := <-msgCh:
+		t.Fatalf("duplicate multi-select was dispatched: %#v", duplicate)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	_, emptyCardID := ip.prepareChoiceCardForSession(core.NewCard().
+		Markdown("**Choose none**").
+		MultiSelect([]core.CardMultiSelectOption{{Text: "**1. Apple**", Value: "1"}},
+			"Confirm selection", "askq:1:multi", map[string]string{"askq_request_id": "request-empty"}).
+		Build(), "feishu:test-session")
+	emptyEvent := &callback.CardActionTriggerEvent{Event: &callback.CardActionTriggerRequest{
+		Operator: &callback.Operator{OpenID: "ou_test_user"},
+		Action: &callback.CallBackAction{
+			Tag: "button", Name: askQuestionSubmitName("askq:1:multi", emptyCardID),
+		},
+		Context: &callback.Context{OpenChatID: "oc_test_chat", OpenMessageID: "om_test_message_empty"},
+	}}
+	if _, err := ip.onCardAction(emptyEvent); err != nil {
+		t.Fatalf("empty selection onCardAction() error = %v", err)
+	}
+	select {
+	case msg := <-msgCh:
+		if msg.Content != "askq:1:multi:" {
+			t.Fatalf("empty selection dispatch = %#v, want explicit empty selection", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("empty multi-select submission was not dispatched")
+	}
+}
+
 func TestInteractivePlatform_CardActionActWithoutCardResponseDoesNotWarn(t *testing.T) {
 	platformAny, err := New(map[string]any{"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": true})
 	if err != nil {

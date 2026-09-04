@@ -1424,6 +1424,21 @@ func serializeCard(c *Card) map[string]any {
 				"type": "list_item", "text": e.Text,
 				"btn_text": e.BtnText, "btn_type": e.BtnType, "btn_value": e.BtnValue,
 			})
+		case CardChoice:
+			// Older bridge clients do not know about whole-block choices, so
+			// preserve interaction through their existing list-item shape.
+			elements = append(elements, map[string]any{
+				"type": "list_item", "text": e.Text,
+				"btn_text": e.ButtonText, "btn_type": "default", "btn_value": e.Value,
+			})
+		case CardMultiSelect:
+			// The bridge protocol has no checkbox-form shape yet. Preserve all
+			// content and let the ordinary message-input fallback accept numbers.
+			for _, option := range e.Options {
+				elements = append(elements, map[string]any{
+					"type": "markdown", "content": "☐ " + option.Text,
+				})
+			}
 		case CardSelect:
 			var opts []map[string]string
 			for _, o := range e.Options {

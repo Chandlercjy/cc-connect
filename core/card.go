@@ -54,6 +54,32 @@ type CardListItem struct {
 	Extra    map[string]string // additional key-value pairs carried in the callback
 }
 
+// CardChoice renders one selectable block. Platforms with whole-block
+// interactions can make Text directly clickable; others may fall back to a
+// conventional button using ButtonText.
+type CardChoice struct {
+	Text       string            // complete option text shown to the user
+	ButtonText string            // fallback button label
+	Value      string            // callback data
+	Extra      map[string]string // additional callback metadata
+}
+
+// CardMultiSelect renders a group of locally toggleable options with one
+// submit action. Rich platforms may map it to a native checkbox form; text
+// fallbacks display the complete numbered list and accept a typed response.
+type CardMultiSelect struct {
+	Options    []CardMultiSelectOption
+	SubmitText string
+	Value      string            // callback data for the form submission
+	Extra      map[string]string // additional callback metadata
+}
+
+// CardMultiSelectOption is one checkbox row in a CardMultiSelect.
+type CardMultiSelectOption struct {
+	Text  string // complete wrapping option content
+	Value string // stable option value, normally its 1-based ordinal
+}
+
 // CardSelect renders a dropdown selector.
 // On Feishu this maps to select_static; on other platforms it degrades to text.
 type CardSelect struct {
@@ -68,12 +94,14 @@ type CardSelectOption struct {
 	Value string
 }
 
-func (CardMarkdown) cardElement() {}
-func (CardDivider) cardElement()  {}
-func (CardActions) cardElement()  {}
-func (CardNote) cardElement()     {}
-func (CardListItem) cardElement() {}
-func (CardSelect) cardElement()   {}
+func (CardMarkdown) cardElement()    {}
+func (CardDivider) cardElement()     {}
+func (CardActions) cardElement()     {}
+func (CardNote) cardElement()        {}
+func (CardListItem) cardElement()    {}
+func (CardChoice) cardElement()      {}
+func (CardMultiSelect) cardElement() {}
+func (CardSelect) cardElement()      {}
 
 // CardButton represents a clickable button inside a CardActions element.
 type CardButton struct {
@@ -190,6 +218,26 @@ func (b *CardBuilder) ListItemBtnExtra(desc, btnText, btnType, btnValue string, 
 	return b
 }
 
+// Choice appends a selectable content block.
+func (b *CardBuilder) Choice(text, buttonText, value string, extra map[string]string) *CardBuilder {
+	if text != "" && value != "" {
+		b.card.Elements = append(b.card.Elements, CardChoice{
+			Text: text, ButtonText: buttonText, Value: value, Extra: extra,
+		})
+	}
+	return b
+}
+
+// MultiSelect appends a checkbox group with one submit action.
+func (b *CardBuilder) MultiSelect(options []CardMultiSelectOption, submitText, value string, extra map[string]string) *CardBuilder {
+	if len(options) > 0 && submitText != "" && value != "" {
+		b.card.Elements = append(b.card.Elements, CardMultiSelect{
+			Options: options, SubmitText: submitText, Value: value, Extra: extra,
+		})
+	}
+	return b
+}
+
 // Select appends a dropdown selector element.
 func (b *CardBuilder) Select(placeholder string, options []CardSelectOption, initValue string) *CardBuilder {
 	if len(options) > 0 {
@@ -257,6 +305,18 @@ func (c *Card) RenderText() string {
 			sb.WriteString("  [")
 			sb.WriteString(e.BtnText)
 			sb.WriteString("]\n")
+		case CardChoice:
+			sb.WriteString(e.Text)
+			sb.WriteString("\n\n")
+		case CardMultiSelect:
+			for _, option := range e.Options {
+				sb.WriteString("☐ ")
+				sb.WriteString(option.Text)
+				sb.WriteString("\n")
+			}
+			sb.WriteString("[")
+			sb.WriteString(e.SubmitText)
+			sb.WriteString("]\n\n")
 		case CardSelect:
 			sb.WriteString(e.Placeholder)
 			sb.WriteString(": ")
@@ -280,7 +340,7 @@ func (c *Card) RenderText() string {
 func (c *Card) HasButtons() bool {
 	for _, elem := range c.Elements {
 		switch elem.(type) {
-		case CardActions, CardListItem, CardSelect:
+		case CardActions, CardListItem, CardChoice, CardMultiSelect, CardSelect:
 			return true
 		}
 	}
@@ -304,6 +364,8 @@ func (c *Card) CollectButtons() [][]ButtonOption {
 			}
 		case CardListItem:
 			rows = append(rows, []ButtonOption{{Text: e.BtnText, Data: e.BtnValue}})
+		case CardChoice:
+			rows = append(rows, []ButtonOption{{Text: e.ButtonText, Data: e.Value}})
 		}
 	}
 	return rows

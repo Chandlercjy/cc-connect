@@ -2,6 +2,7 @@ package feishu
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -167,6 +168,144 @@ func TestRenderCardMap_DefaultActionsStayActionRow(t *testing.T) {
 		if !ok || value["action"] != want.Value {
 			t.Fatalf("button %d value = %#v, want %q", i, btn["value"], want.Value)
 		}
+	}
+}
+
+func TestRenderCardMap_ChoiceUsesClickableCard2Container(t *testing.T) {
+	longLabel := strings.Repeat("Long mobile option ", 8)
+	choiceText := "**1. " + longLabel + "**\n" + strings.Repeat("Full explanation ", 10)
+	card := core.NewCard().
+		Title("Agent Question", "blue").
+		Markdown("**Choose an implementation**").
+		Choice(choiceText, longLabel, "askq:0:1", map[string]string{
+			"askq_label": longLabel, "askq_question": "Choose an implementation",
+		}).
+		Note("Tap an option to select it.").
+		Build()
+
+	rendered, err := json.Marshal(renderCardMap(card, "thread-key"))
+	if err != nil {
+		t.Fatalf("marshal choice card: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rendered, &got); err != nil {
+		t.Fatalf("decode choice card: %v", err)
+	}
+	if got["schema"] != "2.0" {
+		t.Fatalf("schema = %#v, want Card 2.0", got["schema"])
+	}
+	if _, exists := got["elements"]; exists {
+		t.Fatal("Card 2.0 choice card must put elements under body")
+	}
+	body, ok := got["body"].(map[string]any)
+	if !ok {
+		t.Fatalf("body = %#v, want object", got["body"])
+	}
+	elements, ok := body["elements"].([]any)
+	if !ok || len(elements) != 3 {
+		t.Fatalf("elements = %#v, want question, choice, and note", body["elements"])
+	}
+	container, ok := elements[1].(map[string]any)
+	if !ok || container["tag"] != "interactive_container" {
+		t.Fatalf("choice = %#v, want interactive_container", elements[1])
+	}
+	if container["width"] != "fill" || container["has_border"] != true {
+		t.Fatalf("choice container layout = %#v, want full-width bordered block", container)
+	}
+	inner, ok := container["elements"].([]any)
+	if !ok || len(inner) != 1 {
+		t.Fatalf("choice elements = %#v, want one markdown element", container["elements"])
+	}
+	markdown, ok := inner[0].(map[string]any)
+	if !ok || markdown["tag"] != "markdown" || markdown["content"] != choiceText {
+		t.Fatalf("choice markdown = %#v, want complete content", inner[0])
+	}
+	behaviors, ok := container["behaviors"].([]any)
+	if !ok || len(behaviors) != 1 {
+		t.Fatalf("behaviors = %#v, want one callback", container["behaviors"])
+	}
+	behavior, ok := behaviors[0].(map[string]any)
+	if !ok || behavior["type"] != "callback" {
+		t.Fatalf("behavior = %#v, want callback", behaviors[0])
+	}
+	value, ok := behavior["value"].(map[string]any)
+	if !ok || value["action"] != "askq:0:1" || value["session_key"] != "thread-key" || value["askq_label"] != longLabel {
+		t.Fatalf("callback value = %#v, want preserved action/session/label", behavior["value"])
+	}
+	if strings.Contains(string(rendered), `"tag":"button"`) {
+		t.Fatalf("choice card unexpectedly contains a separate button: %s", rendered)
+	}
+}
+
+func TestRenderCardMap_MultiSelectUsesCheckerFormAndOneSubmit(t *testing.T) {
+	card := core.NewCard().
+		Title("Agent Question", "blue").
+		Markdown("**Choose fruits**").
+		MultiSelect([]core.CardMultiSelectOption{
+			{Text: "**1. Apple**\nKeeps well", Value: "1"},
+			{Text: "**2. Banana**\nGood for breakfast", Value: "2"},
+		}, "Confirm selection", "askq:0:multi", map[string]string{
+			choiceCardIDKey: "test-card", "askq_question": "Choose fruits",
+		}).
+		Note("Select all that apply, then confirm.").
+		Build()
+
+	got := renderCardMap(card, "thread-key")
+	if got["schema"] != "2.0" {
+		t.Fatalf("schema = %#v, want Card 2.0", got["schema"])
+	}
+	body, ok := got["body"].(map[string]any)
+	if !ok {
+		t.Fatalf("body = %#v", got["body"])
+	}
+	elements, ok := body["elements"].([]map[string]any)
+	if !ok || len(elements) != 3 {
+		t.Fatalf("elements = %#v, want question, form, note", body["elements"])
+	}
+	form := elements[1]
+	if form["tag"] != "form" || form["name"] != "askq_multi_form" {
+		t.Fatalf("form = %#v", form)
+	}
+	formElements, ok := form["elements"].([]map[string]any)
+	if !ok || len(formElements) != 3 {
+		t.Fatalf("form elements = %#v, want 2 checkers and submit", form["elements"])
+	}
+	for i := 0; i < 2; i++ {
+		checker := formElements[i]
+		if checker["tag"] != "checker" || checker["name"] != fmt.Sprintf("askq_option_%d", i+1) {
+			t.Fatalf("checker %d = %#v", i, checker)
+		}
+		if _, exists := checker["behaviors"]; exists {
+			t.Fatalf("checker %d triggers a callback instead of toggling locally: %#v", i, checker)
+		}
+		text, _ := checker["text"].(map[string]any)
+		if text["tag"] != "lark_md" || !strings.Contains(fmt.Sprint(text["content"]), "**") {
+			t.Fatalf("checker text = %#v, want wrapping markdown", checker["text"])
+		}
+	}
+	submit := formElements[2]
+	if submit["tag"] != "button" || submit["form_action_type"] != "submit" || submit["width"] != "fill" || submit["type"] != "primary_filled" {
+		t.Fatalf("submit = %#v", submit)
+	}
+	action, cardID, ok := parseAskQuestionSubmitName(fmt.Sprint(submit["name"]))
+	if !ok || action != "askq:0:multi" || cardID != "test-card" {
+		t.Fatalf("submit name = %#v, want encoded action and card ID", submit["name"])
+	}
+	if _, exists := submit["value"]; exists {
+		t.Fatalf("Card 2.0 form submit uses deprecated top-level value: %#v", submit)
+	}
+	if _, exists := submit["behaviors"]; exists {
+		t.Fatalf("form submit should not use behaviors: %#v", submit)
+	}
+}
+
+func TestSelectChoiceCard_UnknownTrackedNonceFailsClosed(t *testing.T) {
+	p := &Platform{choiceCards: make(map[string]*choiceCardState)}
+	if snapshot, action, accepted := p.selectChoiceCard("missing-card", "askq:0:1"); accepted || snapshot != nil || action != "askq:0:1" {
+		t.Fatalf("unknown tracked callback = snapshot %#v action %q accepted %v", snapshot, action, accepted)
+	}
+	if _, _, accepted := p.selectChoiceCard("", "askq:0:1"); !accepted {
+		t.Fatal("legacy callback without a nonce should remain supported")
 	}
 }
 

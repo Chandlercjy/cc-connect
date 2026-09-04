@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1989,7 +1991,131 @@ func TestPiSession_RespondPermission(t *testing.T) {
 	}
 }
 
-// ── forwardSelect / forwardConfirm: Questions wiring ────────
+// ── extension UI request wiring ─────────────────────────────
+
+func TestForwardInput_PopulatesFreeTextQuestion(t *testing.T) {
+	s := newTestSession(true)
+	defer s.cancel()
+
+	s.forwardInput("input-1", map[string]any{
+		"title":       "Name this release",
+		"placeholder": "Enter a short name",
+	})
+
+	evts := drainEvents(s)
+	if len(evts) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(evts))
+	}
+	evt := evts[0]
+	if evt.ToolName != "extension_input" || len(evt.Questions) != 1 {
+		t.Fatalf("event = %#v, want extension_input with one question", evt)
+	}
+	question := evt.Questions[0]
+	if question.Question != "Name this release" || question.Placeholder != "Enter a short name" {
+		t.Fatalf("question = %#v", question)
+	}
+	if len(question.Options) != 0 {
+		t.Fatalf("input question options = %#v, want none", question.Options)
+	}
+}
+
+func TestForwardInput_UsesStructuredMultiSelectQuestion(t *testing.T) {
+	s := newTestSession(true)
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{
+		"type": "message_update",
+		"assistantMessageEvent": map[string]any{
+			"type": "toolcall_end",
+			"toolCall": map[string]any{
+				"type": "toolCall",
+				"name": "ask_user_question",
+				"arguments": map[string]any{
+					"questions": []any{
+						map[string]any{
+							"question":    "Choose fruits",
+							"header":      "Purchase",
+							"multiSelect": true,
+							"options": []any{
+								map[string]any{"label": "Apple", "description": "Keeps well"},
+								map[string]any{"label": "Banana", "description": "Good for breakfast"},
+								map[string]any{"label": "Orange", "description": "Good for juice"},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	// Discard the normal EventToolUse emitted for progress rendering.
+	_ = drainEvents(s)
+
+	s.handleEvent(map[string]any{
+		"type":        "extension_ui_request",
+		"id":          "input-multi-1",
+		"method":      "input",
+		"title":       "[Purchase] Choose fruits\n\n1. Apple — Keeps well\n2. Banana — Good for breakfast\n3. Orange — Good for juice\n\nEnter comma-separated numbers",
+		"placeholder": "1,3",
+	})
+
+	evts := drainEvents(s)
+	if len(evts) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(evts))
+	}
+	q := evts[0].Questions[0]
+	if !q.MultiSelect || q.Question != "Choose fruits" || q.Header != "Purchase" {
+		t.Fatalf("question = %#v, want structured multi-select metadata", q)
+	}
+	want := []core.UserQuestionOption{
+		{Label: "Apple", Description: "Keeps well"},
+		{Label: "Banana", Description: "Good for breakfast"},
+		{Label: "Orange", Description: "Good for juice"},
+	}
+	if !reflect.DeepEqual(q.Options, want) {
+		t.Fatalf("options = %#v, want %#v", q.Options, want)
+	}
+}
+
+func TestRespondPermission_InputUsesCollectedAnswer(t *testing.T) {
+	s := newTestSession(true)
+	defer s.cancel()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	s.rpcStdin = writer
+	s.extPending["input-1"] = "pi_ext_input-1"
+	s.extPendingRev["pi_ext_input-1"] = "input-1"
+	s.extMethod["pi_ext_input-1"] = "input"
+
+	err = s.RespondPermission("pi_ext_input-1", core.PermissionResult{
+		Behavior: "allow",
+		UpdatedInput: map[string]any{
+			"answers": map[string]any{"Name this release": "Aurora"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("RespondPermission() error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(payload, &response); err != nil {
+		t.Fatalf("decode response %q: %v", payload, err)
+	}
+	if response["value"] != "Aurora" {
+		t.Fatalf("extension input value = %#v, want collected answer", response["value"])
+	}
+	if _, cancelled := response["cancelled"]; cancelled {
+		t.Fatalf("extension input was unexpectedly cancelled: %#v", response)
+	}
+}
 
 func TestForwardSelect_PopulatesQuestions(t *testing.T) {
 	s := newTestSession(true) // rpc mode

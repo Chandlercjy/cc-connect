@@ -2435,6 +2435,10 @@ func countCardActionValues(card *Card, prefix string) int {
 			if strings.HasPrefix(e.BtnValue, prefix) {
 				count++
 			}
+		case CardChoice:
+			if strings.HasPrefix(e.Value, prefix) {
+				count++
+			}
 		}
 	}
 	return count
@@ -2496,6 +2500,10 @@ func findCardAction(card *Card, value string) (CardButton, bool) {
 		case CardListItem:
 			if e.BtnValue == value {
 				return CardButton{Text: e.BtnText, Type: e.BtnType, Value: e.BtnValue}, true
+			}
+		case CardChoice:
+			if e.Value == value {
+				return CardButton{Text: e.ButtonText, Type: "default", Value: e.Value, Extra: e.Extra}, true
 			}
 		}
 	}
@@ -6506,6 +6514,28 @@ func TestHandleCardNav_HelpToolsShowsCronExecUsage(t *testing.T) {
 
 // --- AskUserQuestion tests ---
 
+func TestIsAskQuestionEvent_ExtensionInputRequiresAnswerFlow(t *testing.T) {
+	question := []UserQuestion{{Question: "Name this release"}}
+	tests := []struct {
+		name  string
+		event Event
+		want  bool
+	}{
+		{name: "extension input", event: Event{ToolName: "extension_input", Questions: question}, want: true},
+		{name: "extension select", event: Event{ToolName: "extension_select", Questions: question}, want: true},
+		{name: "agent question", event: Event{ToolName: "AskUserQuestion", Questions: question}, want: true},
+		{name: "confirm stays permission", event: Event{ToolName: "extension_confirm", Questions: question}, want: false},
+		{name: "input without structured question", event: Event{ToolName: "extension_input"}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isAskQuestionEvent(tt.event); got != tt.want {
+				t.Fatalf("isAskQuestionEvent() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func testQuestions() []UserQuestion {
 	return []UserQuestion{{
 		Question: "Which database?",
@@ -6571,9 +6601,10 @@ func TestResolveAskQuestionAnswer_MultiSelect(t *testing.T) {
 	e := newTestEngine()
 	q := testQuestions()[0]
 	q.MultiSelect = true
-	got := e.resolveAskQuestionAnswer(q, "1,3")
-	if got != "PostgreSQL, MySQL" {
-		t.Errorf("expected 'PostgreSQL, MySQL', got %s", got)
+	for _, input := range []string{"1,3", "askq:0:multi:1,3"} {
+		if got := e.resolveAskQuestionAnswer(q, input); got != "PostgreSQL, MySQL" {
+			t.Errorf("resolveAskQuestionAnswer(%q) = %q, want 'PostgreSQL, MySQL'", input, got)
+		}
 	}
 }
 
@@ -6622,6 +6653,167 @@ func TestSendAskQuestionPrompt_CardPlatform(t *testing.T) {
 	askqCount := countCardActionValues(card, "askq:")
 	if askqCount != 3 {
 		t.Errorf("expected 3 askq buttons, got %d", askqCount)
+	}
+}
+
+func TestSendAskQuestionPrompt_CardPlatform_MultiSelectUsesSingleForm(t *testing.T) {
+	e := newTestEngine()
+	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	questions := []UserQuestion{{
+		Question:    "Choose fruits",
+		Header:      "Purchase",
+		MultiSelect: true,
+		Options: []UserQuestionOption{
+			{Label: "1. Apple", Description: "Keeps well"},
+			{Label: "Banana", Description: "Good for breakfast"},
+			{Label: "Orange", Description: "Good for juice"},
+		},
+	}}
+
+	e.sendAskQuestionPromptForRequest(p, "ctx", "request-multi-1", questions, 0)
+
+	if len(p.sentCards) != 1 {
+		t.Fatalf("expected 1 card, got %d", len(p.sentCards))
+	}
+	var groups []CardMultiSelect
+	for _, elem := range p.sentCards[0].Elements {
+		switch elem := elem.(type) {
+		case CardMultiSelect:
+			groups = append(groups, elem)
+		case CardChoice, CardActions, CardListItem:
+			t.Fatalf("multi-select rendered immediate-submit control: %#v", elem)
+		}
+	}
+	if len(groups) != 1 {
+		t.Fatalf("multi-select groups = %d, want 1", len(groups))
+	}
+	group := groups[0]
+	if group.Value != "askq:0:multi" || group.SubmitText == "" || len(group.Options) != 3 {
+		t.Fatalf("multi-select group = %#v", group)
+	}
+	if group.Options[0].Text != "**1. Apple**\nKeeps well" || group.Options[0].Value != "1" {
+		t.Fatalf("first option = %#v, want one canonical ordinal and description", group.Options[0])
+	}
+	if group.Extra["askq_question"] != "Choose fruits" || group.Extra["askq_answered"] == "" || group.Extra["askq_request_id"] != "request-multi-1" {
+		t.Fatalf("callback metadata = %#v", group.Extra)
+	}
+	if !strings.Contains(p.sentCards[0].RenderText(), "Confirm selection") {
+		t.Fatalf("text fallback does not explain submission: %q", p.sentCards[0].RenderText())
+	}
+}
+
+func TestOptionLabelWithoutMatchingOrdinal(t *testing.T) {
+	tests := []struct {
+		name    string
+		label   string
+		ordinal int
+		want    string
+	}{
+		{name: "dot and space", label: "1. Ready", ordinal: 1, want: "Ready"},
+		{name: "parenthesis", label: "2) Ready", ordinal: 2, want: "Ready"},
+		{name: "full-width parenthesis", label: "3）就绪", ordinal: 3, want: "就绪"},
+		{name: "ideographic comma", label: "4、就绪", ordinal: 4, want: "就绪"},
+		{name: "colon", label: "5: Ready", ordinal: 5, want: "Ready"},
+		{name: "decimal is content", label: "1.5 release", ordinal: 1, want: "1.5 release"},
+		{name: "different ordinal", label: "2. Ready", ordinal: 1, want: "2. Ready"},
+		{name: "empty suffix", label: "1.", ordinal: 1, want: "1."},
+		{name: "no ordinal", label: "Ready", ordinal: 1, want: "Ready"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := optionLabelWithoutMatchingOrdinal(tt.label, tt.ordinal); got != tt.want {
+				t.Fatalf("optionLabelWithoutMatchingOrdinal(%q, %d) = %q, want %q", tt.label, tt.ordinal, got, tt.want)
+			}
+		})
+	}
+}
+
+// Regression: a long AskUserQuestion option must appear exactly once in a
+// whole-block choice. Rendering the label again on a side button is visually
+// repetitive and the button text is clipped by Feishu mobile.
+func TestSendAskQuestionPrompt_CardPlatform_LongOptionUsesClickableBlock(t *testing.T) {
+	e := newTestEngine()
+	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	optionBody := strings.Repeat("Long option content ", 8)
+	longLabel := "1. " + optionBody
+	longDescription := strings.Repeat("Detailed explanation ", 10)
+	questions := []UserQuestion{{
+		Question: "Choose an implementation",
+		Options: []UserQuestionOption{{
+			Label:       longLabel,
+			Description: longDescription,
+		}},
+	}}
+
+	e.sendAskQuestionPrompt(p, "ctx", questions, 0)
+
+	if len(p.sentCards) != 1 {
+		t.Fatalf("expected 1 card, got %d", len(p.sentCards))
+	}
+	var choices []CardChoice
+	for _, elem := range p.sentCards[0].Elements {
+		switch elem := elem.(type) {
+		case CardChoice:
+			choices = append(choices, elem)
+		case CardActions:
+			for _, btn := range elem.Buttons {
+				if strings.Contains(btn.Text, longLabel) {
+					t.Fatal("long option was repeated on a separate button")
+				}
+			}
+		case CardListItem:
+			if strings.Contains(elem.Text, longLabel) || strings.Contains(elem.BtnText, longLabel) {
+				t.Fatal("long option rendered in a constrained CardListItem column")
+			}
+		}
+	}
+	if len(choices) != 1 {
+		t.Fatalf("clickable choices = %d, want 1", len(choices))
+	}
+	choice := choices[0]
+	wantText := "**1. " + strings.TrimSpace(optionBody) + "**\n" + longDescription
+	if choice.Text != wantText {
+		t.Fatalf("choice text = %q, want one canonical option number in %q", choice.Text, wantText)
+	}
+	if choice.Value != "askq:0:1" {
+		t.Fatalf("choice value = %q, want askq:0:1", choice.Value)
+	}
+	if choice.Extra["askq_label"] != longLabel || choice.Extra["askq_question"] != questions[0].Question || choice.Extra["askq_answered"] == "" {
+		t.Fatalf("choice callback metadata was not preserved: %#v", choice.Extra)
+	}
+}
+
+func TestSendAskQuestionPrompt_CardPlatform_InputRequestsTextReply(t *testing.T) {
+	e := newTestEngine()
+	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	questions := []UserQuestion{{
+		Question: "[Purchase] Choose fruits\n\n" +
+			"1. Apple — Long first description\n" +
+			"2. Banana — Long second description\n\n" +
+			"Enter comma-separated numbers",
+		Placeholder: "1,2",
+	}}
+
+	e.sendAskQuestionPrompt(p, "ctx", questions, 0)
+
+	if len(p.sentCards) != 1 {
+		t.Fatalf("expected 1 card, got %d", len(p.sentCards))
+	}
+	card := p.sentCards[0]
+	visible := card.RenderText()
+	for _, want := range []string{"Choose fruits", "1. Apple", "2. Banana", "Enter comma-separated numbers", "1,2"} {
+		if !strings.Contains(visible, want) {
+			t.Fatalf("input prompt = %q, missing %q", visible, want)
+		}
+	}
+	if strings.Contains(visible, "Tap an option") {
+		t.Fatalf("input prompt incorrectly asks user to tap an option: %q", visible)
+	}
+	for _, elem := range card.Elements {
+		switch elem.(type) {
+		case CardActions, CardListItem, CardChoice, CardSelect:
+			t.Fatalf("free-text input prompt contains an interactive choice: %#v", elem)
+		}
 	}
 }
 
@@ -7157,6 +7349,125 @@ func TestHandlePendingPermission_ExtensionSelect_StillRoutedAsAskUserQuestion(t 
 	// UpdatedInput. extension_select must take this path; extension_confirm
 	// (the regression) must NOT. If a future refactor ever strips
 	// extension_select out of the AskUserQuestion list, this test catches it.
+}
+
+func TestHandlePendingPermission_ExtensionInputCollectsTextAnswer(t *testing.T) {
+	e := newTestEngine()
+	p := &stubPlatformEngine{n: "test"}
+	rec := &recordingAgentSession{}
+	question := "[Purchase] Choose fruits\n\n1. Apple\n2. Banana"
+	state := &interactiveState{
+		agentSession: rec,
+		platform:     p,
+		replyCtx:     "ctx",
+		pending: &pendingPermission{
+			RequestID: "pi_ext_input-1",
+			ToolName:  "extension_input",
+			ToolInput: map[string]any{"method": "input", "placeholder": "1,2"},
+			Questions: []UserQuestion{{
+				Question: question, Placeholder: "1,2",
+			}},
+			Resolved: make(chan struct{}),
+		},
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates["test:chat:user1"] = state
+	e.interactiveMu.Unlock()
+
+	if !e.handlePendingPermission(p, &Message{
+		SessionKey: "test:chat:user1",
+		UserID:     "user1",
+		Content:    "1,2",
+		ReplyCtx:   "ctx",
+	}, "1,2", "") {
+		t.Fatal("expected input answer to resolve pending question")
+	}
+	if rec.calls != 1 || rec.lastResult.Behavior != "allow" {
+		t.Fatalf("permission result = %#v, calls=%d", rec.lastResult, rec.calls)
+	}
+	answers, ok := rec.lastResult.UpdatedInput["answers"].(map[string]any)
+	if !ok || answers[question] != "1,2" {
+		t.Fatalf("updated input = %#v, want collected text answer", rec.lastResult.UpdatedInput)
+	}
+}
+
+func TestHandlePendingPermission_ExtensionInputMultiSelectPreservesNumericValue(t *testing.T) {
+	e := newTestEngine()
+	p := &stubPlatformEngine{n: "test"}
+	rec := &recordingAgentSession{}
+	state := &interactiveState{
+		agentSession: rec,
+		platform:     p,
+		replyCtx:     "ctx",
+		pending: &pendingPermission{
+			RequestID: "pi_ext_input-multi",
+			ToolName:  "extension_input",
+			ToolInput: map[string]any{"method": "input", "placeholder": "1,3"},
+			Questions: []UserQuestion{{
+				Question:    "Choose fruits",
+				Options:     []UserQuestionOption{{Label: "Apple"}, {Label: "Banana"}, {Label: "Orange"}},
+				MultiSelect: true,
+			}},
+			Resolved: make(chan struct{}),
+		},
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates["test:chat:user1"] = state
+	e.interactiveMu.Unlock()
+
+	if !e.handlePendingPermission(p, &Message{
+		SessionKey:           "test:chat:user1",
+		UserID:               "user1",
+		Content:              "askq:0:multi:1,3",
+		ReplyCtx:             "ctx",
+		IsPermissionResponse: true,
+	}, "askq:0:multi:1,3", "") {
+		t.Fatal("expected multi-select form submission to resolve pending input")
+	}
+	answers, ok := rec.lastResult.UpdatedInput["answers"].(map[string]any)
+	if !ok || answers["Choose fruits"] != "1,3" {
+		t.Fatalf("updated input = %#v, want raw numeric value for Pi parser", rec.lastResult.UpdatedInput)
+	}
+	if sent := p.getSent(); len(sent) != 0 {
+		t.Fatalf("card callback produced duplicate acknowledgement message: %#v", sent)
+	}
+}
+
+func TestHandlePendingPermission_DropsMismatchedAskQuestionCard(t *testing.T) {
+	e := newTestEngine()
+	p := &stubPlatformEngine{n: "test"}
+	rec := &recordingAgentSession{}
+	state := &interactiveState{
+		agentSession: rec,
+		platform:     p,
+		replyCtx:     "ctx",
+		pending: &pendingPermission{
+			RequestID: "current-request",
+			ToolName:  "extension_input",
+			Questions: []UserQuestion{{
+				Question: "Current question", Options: []UserQuestionOption{{Label: "A"}},
+			}},
+			Resolved: make(chan struct{}),
+		},
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates["test:chat:user1"] = state
+	e.interactiveMu.Unlock()
+
+	handled := e.handlePendingPermission(p, &Message{
+		SessionKey:           "test:chat:user1",
+		UserID:               "user1",
+		Content:              "askq:0:1",
+		ReplyCtx:             "ctx",
+		IsPermissionResponse: true,
+		PermissionRequestID:  "old-request",
+	}, "askq:0:1", "")
+	if !handled {
+		t.Fatal("stale card callback should be consumed")
+	}
+	if rec.calls != 0 || state.pending == nil {
+		t.Fatalf("stale callback changed current request: calls=%d pending=%#v", rec.calls, state.pending)
+	}
 }
 
 // TestHandlePendingPermission_CronFallback verifies that the fallback path

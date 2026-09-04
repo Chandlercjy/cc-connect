@@ -96,6 +96,13 @@ type piSession struct {
 	extPending    map[string]string // Pi ext_ui_id -> cc-conn RequestID
 	extPendingRev map[string]string // cc-conn RequestID -> Pi ext_ui_id
 	extMethod     map[string]string // cc-conn RequestID -> method ("confirm"|"input"|"select")
+
+	// askQuestions retains the original structured ask_user_question payload
+	// while its RPC fallback walks one extension select/input dialog at a time.
+	// In particular, multi-select questions otherwise arrive as one flattened
+	// extension_input title, which is unsuitable for a native checkbox card.
+	askQuestionsMu sync.Mutex
+	askQuestions   []core.UserQuestion
 }
 
 // stateProbeID is the request id used for the get_state probe that startRPC
@@ -746,9 +753,69 @@ func (s *piSession) forwardConfirm(id string, raw map[string]any) {
 	}
 }
 
+func (s *piSession) rememberAskQuestions(toolCall map[string]any) {
+	args := toolCallArguments(toolCall)
+	if len(args) == 0 {
+		return
+	}
+	b, err := json.Marshal(args)
+	if err != nil {
+		return
+	}
+	var payload struct {
+		Questions []core.UserQuestion `json:"questions"`
+	}
+	if err := json.Unmarshal(b, &payload); err != nil || len(payload.Questions) == 0 {
+		return
+	}
+
+	s.askQuestionsMu.Lock()
+	// Tool calls execute sequentially. A new ask_user_question invocation
+	// therefore supersedes any unconsumed questions left by a cancelled one.
+	s.askQuestions = append([]core.UserQuestion(nil), payload.Questions...)
+	s.askQuestionsMu.Unlock()
+}
+
+func (s *piSession) takeAskQuestion(title string, multiSelect bool) (core.UserQuestion, bool) {
+	s.askQuestionsMu.Lock()
+	defer s.askQuestionsMu.Unlock()
+	if len(s.askQuestions) == 0 {
+		return core.UserQuestion{}, false
+	}
+	q := s.askQuestions[0]
+	if q.MultiSelect != multiSelect || !matchesAskQuestionDialogTitle(title, q) {
+		return core.UserQuestion{}, false
+	}
+	s.askQuestions = s.askQuestions[1:]
+	return q, true
+}
+
+func matchesAskQuestionDialogTitle(title string, q core.UserQuestion) bool {
+	prefix := q.Question
+	if q.Header != "" {
+		prefix = "[" + q.Header + "] " + prefix
+	}
+	title = strings.TrimSpace(title)
+	return title == prefix || strings.HasPrefix(title, prefix+"\n")
+}
+
 func (s *piSession) forwardInput(id string, raw map[string]any) {
 	title, _ := raw["title"].(string)
 	placeholder, _ := raw["placeholder"].(string)
+	question, structured := s.takeAskQuestion(title, true)
+	if !structured {
+		questionText := strings.TrimSpace(title)
+		if questionText == "" {
+			questionText = "Provide input"
+		}
+		question = core.UserQuestion{
+			Question:    questionText,
+			Header:      "Input",
+			Placeholder: placeholder,
+		}
+	} else {
+		question.Placeholder = placeholder
+	}
 
 	requestID := fmt.Sprintf("pi_ext_%s", id)
 
@@ -768,6 +835,10 @@ func (s *piSession) forwardInput(id string, raw map[string]any) {
 			"placeholder": placeholder,
 			"method":      "input",
 		},
+		// Input is a question, not a tool permission decision. Generic inputs
+		// remain free text; ask_user_question multi-select inputs retain their
+		// original options so rich platforms can render native checkboxes.
+		Questions: []core.UserQuestion{question},
 	}
 	select {
 	case s.events <- evt:
@@ -778,6 +849,10 @@ func (s *piSession) forwardInput(id string, raw map[string]any) {
 func (s *piSession) forwardSelect(id string, raw map[string]any) {
 	title, _ := raw["title"].(string)
 	options, _ := raw["options"].([]any)
+	// Keep the structured questionnaire cursor aligned. The select response
+	// must still use the exact RPC option strings below, so we consume but do
+	// not substitute the original single-select question here.
+	_, _ = s.takeAskQuestion(title, false)
 
 	// Pi Agent sends options in either of two shapes:
 	//   - []string                         ("Red", "Green", "Blue")
@@ -929,6 +1004,9 @@ func (s *piSession) emitToolFromMessage(ame map[string]any) {
 	if tc, ok := ame["toolCall"].(map[string]any); ok {
 		if itemType, _ := tc["type"].(string); itemType == "toolCall" {
 			name, _ := tc["name"].(string)
+			if name == "ask_user_question" {
+				s.rememberAskQuestions(tc)
+			}
 			input := extractToolInput(tc)
 			evt := core.Event{Type: core.EventToolUse, ToolName: name, ToolInput: input}
 			select {
@@ -961,6 +1039,9 @@ func (s *piSession) emitToolFromMessage(ame map[string]any) {
 			itemType, _ := item["type"].(string)
 			if itemType == "toolCall" {
 				name, _ := item["name"].(string)
+				if name == "ask_user_question" {
+					s.rememberAskQuestions(item)
+				}
 				input := extractToolInput(item)
 				evt := core.Event{Type: core.EventToolUse, ToolName: name, ToolInput: input}
 				select {
@@ -1154,7 +1235,7 @@ func (s *piSession) RespondPermission(requestID string, result core.PermissionRe
 			"id":   extID,
 		}
 		if result.Behavior == "allow" {
-			resp["value"] = result.Message
+			resp["value"] = lastAskQuestionAnswer(result.UpdatedInput)
 		} else {
 			resp["cancelled"] = true
 		}
@@ -1377,11 +1458,21 @@ func truncStr(s string, maxRunes int) string {
 	return string([]rune(s)[:maxRunes]) + "..."
 }
 
-func extractToolInput(item map[string]any) string {
-	args, hasArgs := item["arguments"].(map[string]any)
-	if !hasArgs {
-		args = item
+func toolCallArguments(item map[string]any) map[string]any {
+	if args, ok := item["arguments"].(map[string]any); ok {
+		return args
 	}
+	if encoded, ok := item["arguments"].(string); ok {
+		var args map[string]any
+		if json.Unmarshal([]byte(encoded), &args) == nil {
+			return args
+		}
+	}
+	return item
+}
+
+func extractToolInput(item map[string]any) string {
+	args := toolCallArguments(item)
 
 	if desc, ok := args["description"].(string); ok && desc != "" {
 		return desc

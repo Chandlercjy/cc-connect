@@ -38,6 +38,17 @@ func serializeCard(c *core.Card) map[string]any {
 				"type": "list_item", "text": e.Text,
 				"btn_text": e.BtnText, "btn_type": e.BtnType, "btn_value": e.BtnValue,
 			})
+		case core.CardChoice:
+			elements = append(elements, map[string]any{
+				"type": "list_item", "text": e.Text,
+				"btn_text": e.ButtonText, "btn_type": "default", "btn_value": e.Value,
+			})
+		case core.CardMultiSelect:
+			for _, option := range e.Options {
+				elements = append(elements, map[string]any{
+					"type": "markdown", "content": "☐ " + option.Text,
+				})
+			}
 		case core.CardSelect:
 			var opts []map[string]string
 			for _, o := range e.Options {

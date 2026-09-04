@@ -3404,6 +3404,15 @@ func (e *Engine) handlePendingPermission(p Platform, msg *Message, content strin
 	}
 found:
 
+	// A card action must only answer the exact request that rendered it. This
+	// prevents an old card (including one previously answered by typed fallback)
+	// from being applied to a newer question in the same conversation.
+	if msg.IsPermissionResponse && msg.PermissionRequestID != "" && msg.PermissionRequestID != pending.RequestID {
+		slog.Debug("dropping stale permission callback (request mismatch)",
+			"session", msg.SessionKey, "callback_request", msg.PermissionRequestID, "pending_request", pending.RequestID)
+		return true
+	}
+
 	// AskUserQuestion: interpret user response as an answer, not a permission decision
 	if len(pending.Questions) > 0 {
 		// Reject empty or whitespace-only content: some platforms echo delivery
@@ -3415,8 +3424,20 @@ found:
 		}
 
 		curIdx := pending.CurrentQuestion
+		if callbackIdx, ok := askQuestionCallbackIndex(content); ok && callbackIdx != curIdx {
+			slog.Debug("dropping stale ask-question callback (question mismatch)",
+				"session", msg.SessionKey, "callback_question", callbackIdx, "pending_question", curIdx)
+			return true
+		}
 		q := pending.Questions[curIdx]
 		answer := e.resolveAskQuestionAnswer(q, content)
+		if pending.ToolName == "extension_input" {
+			// Pi's ask_user_question RPC fallback owns multi-select parsing and
+			// expects the input primitive to return its original numeric form
+			// ("1,3"), not cc-connect's display labels. Native form callbacks
+			// carry that value after the fourth colon.
+			answer = extensionInputAnswer(content, q.MultiSelect)
+		}
 
 		if pending.Answers == nil {
 			pending.Answers = make(map[int]string)
@@ -3426,8 +3447,10 @@ found:
 		// More questions remaining — advance to next and send new card
 		if curIdx+1 < len(pending.Questions) {
 			pending.CurrentQuestion = curIdx + 1
-			e.reply(p, msg.ReplyCtx, fmt.Sprintf("✅ %s: **%s**", q.Question, answer))
-			e.sendAskQuestionPrompt(p, msg.ReplyCtx, pending.Questions, curIdx+1)
+			if !msg.IsPermissionResponse {
+				e.reply(p, msg.ReplyCtx, fmt.Sprintf("✅ %s: **%s**", q.Question, answer))
+			}
+			e.sendAskQuestionPromptForRequest(p, msg.ReplyCtx, pending.RequestID, pending.Questions, curIdx+1)
 			return true
 		}
 
@@ -3440,7 +3463,7 @@ found:
 		}); err != nil {
 			slog.Error("failed to send AskUserQuestion response", "error", err)
 			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
-		} else {
+		} else if !msg.IsPermissionResponse {
 			e.reply(p, msg.ReplyCtx, fmt.Sprintf("✅ %s: **%s**", q.Question, answer))
 		}
 
@@ -3514,10 +3537,41 @@ func (e *Engine) lookupPending(iKey string) (*interactiveState, *pendingPermissi
 	return state, pending
 }
 
+func askQuestionCallbackIndex(input string) (int, bool) {
+	parts := strings.SplitN(strings.TrimSpace(input), ":", 3)
+	if len(parts) < 3 || parts[0] != "askq" {
+		return 0, false
+	}
+	index, err := strconv.Atoi(parts[1])
+	return index, err == nil && index >= 0
+}
+
+func extensionInputAnswer(input string, multiSelect bool) string {
+	input = strings.TrimSpace(input)
+	if !multiSelect {
+		return input
+	}
+	parts := strings.SplitN(input, ":", 4)
+	if len(parts) == 4 && parts[0] == "askq" && parts[2] == "multi" {
+		return strings.TrimSpace(parts[3])
+	}
+	return input
+}
+
 // resolveAskQuestionAnswer converts user input into answer text.
 // It handles button callbacks ("askq:qIdx:optIdx"), numeric selections ("1", "1,3"), and free text.
 func (e *Engine) resolveAskQuestionAnswer(q UserQuestion, input string) string {
 	input = strings.TrimSpace(input)
+
+	// Native checkbox forms submit "askq:qIdx:multi:1,3". Generic
+	// AskUserQuestion integrations need labels, while Pi extension_input is
+	// deliberately converted back to the numeric suffix by its caller.
+	if q.MultiSelect {
+		parts := strings.SplitN(input, ":", 4)
+		if len(parts) == 4 && parts[0] == "askq" && parts[2] == "multi" {
+			input = strings.TrimSpace(parts[3])
+		}
+	}
 
 	// Handle card button callback: "askq:qIdx:optIdx"
 	if strings.HasPrefix(input, "askq:") {
@@ -4960,6 +5014,15 @@ var agentErrorHandlers = []agentErrorHandler{
 	{"Session not found", MsgSessionNotFound},
 }
 
+func isAskQuestionEvent(event Event) bool {
+	if len(event.Questions) == 0 {
+		return false
+	}
+	return event.ToolName == "AskUserQuestion" ||
+		event.ToolName == "extension_select" ||
+		event.ToolName == "extension_input"
+}
+
 func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any) {
 	if msgID != "" {
 		state.mu.Lock()
@@ -5612,18 +5675,16 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 		case EventPermissionRequest:
-			// extension_select is a Pi extension UI request routed via the
-			// AskUserQuestion rich-card path. The pi session adapter populates
-			// event.Questions so it renders as a button card (same UX as Claude
-			// Code's AskUserQuestion).
+			// extension_select and extension_input are Pi extension UI requests
+			// routed through the AskUserQuestion path. Select renders choices;
+			// input renders a free-text prompt and waits for an actual reply.
 			//
 			// extension_confirm is intentionally NOT in this list: extensions
 			// use ctx.ui.confirm() to ask the user for permission on a tool
 			// call (e.g. permission-gate on Bash), and the engine must render
 			// it as a regular permission request (Allow/Deny) so the UX
 			// matches other agents. See forwardConfirm in agent/pi/session.go.
-			isAskQuestion := (event.ToolName == "AskUserQuestion" ||
-				event.ToolName == "extension_select") && len(event.Questions) > 0
+			isAskQuestion := isAskQuestionEvent(event)
 
 			state.mu.Lock()
 			autoApprove := state.approveAll
@@ -5675,7 +5736,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.mu.Unlock()
 
 			if isAskQuestion {
-				e.sendAskQuestionPrompt(p, replyCtx, event.Questions, 0)
+				e.sendAskQuestionPromptForRequest(p, replyCtx, event.RequestID, event.Questions, 0)
 			} else {
 				permLimit := e.display.ToolMaxLen
 				if permLimit > 0 {
@@ -11785,9 +11846,53 @@ func (e *Engine) sendPermissionPrompt(p Platform, replyCtx any, prompt, toolName
 	e.send(p, replyCtx, prompt)
 }
 
+func optionLabelWithoutMatchingOrdinal(label string, ordinal int) string {
+	trimmed := strings.TrimSpace(label)
+	number := strconv.Itoa(ordinal)
+	if !strings.HasPrefix(trimmed, number) {
+		return trimmed
+	}
+
+	suffix := strings.TrimPrefix(trimmed, number)
+	var rest string
+	switch {
+	case strings.HasPrefix(suffix, "."):
+		afterDot := strings.TrimPrefix(suffix, ".")
+		if afterDot == "" {
+			return trimmed
+		}
+		first, _ := utf8.DecodeRuneInString(afterDot)
+		if !unicode.IsSpace(first) {
+			// Do not turn a decimal/version such as "1.5" into "5".
+			return trimmed
+		}
+		rest = strings.TrimSpace(afterDot)
+	case strings.HasPrefix(suffix, ")"):
+		rest = strings.TrimSpace(strings.TrimPrefix(suffix, ")"))
+	case strings.HasPrefix(suffix, "）"):
+		rest = strings.TrimSpace(strings.TrimPrefix(suffix, "）"))
+	case strings.HasPrefix(suffix, "、"):
+		rest = strings.TrimSpace(strings.TrimPrefix(suffix, "、"))
+	case strings.HasPrefix(suffix, ":"):
+		rest = strings.TrimSpace(strings.TrimPrefix(suffix, ":"))
+	case strings.HasPrefix(suffix, "："):
+		rest = strings.TrimSpace(strings.TrimPrefix(suffix, "："))
+	default:
+		return trimmed
+	}
+	if rest == "" {
+		return trimmed
+	}
+	return rest
+}
+
 // sendAskQuestionPrompt renders one question (by index) from the AskUserQuestion list.
 // qIdx is the 0-based index of the question to display.
 func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []UserQuestion, qIdx int) {
+	e.sendAskQuestionPromptForRequest(p, replyCtx, "", questions, qIdx)
+}
+
+func (e *Engine) sendAskQuestionPromptForRequest(p Platform, replyCtx any, requestID string, questions []UserQuestion, qIdx int) {
 	if qIdx >= len(questions) {
 		return
 	}
@@ -11803,34 +11908,59 @@ func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []Use
 	if supportsCards(p) {
 		cb := NewCard().Title(e.i18n.T(MsgAskQuestionTitle)+titleSuffix, "blue")
 		body := "**" + q.Question + "**"
-		if q.MultiSelect {
-			// For multiSelect, buttons would resolve on the first click and prevent
-			// selecting multiple options. Render options as a numbered text list
-			// instead, and instruct the user to reply with comma-separated numbers.
-			body += e.i18n.T(MsgAskQuestionMulti) + "\n\n"
-			for i, opt := range q.Options {
-				body += fmt.Sprintf("%d. **%s**", i+1, opt.Label)
-				if opt.Description != "" {
-					body += " — " + opt.Description
-				}
-				body += "\n"
+		if len(q.Options) == 0 {
+			if q.Placeholder != "" {
+				body += "\n\n> " + q.Placeholder
 			}
 			cb.Markdown(body)
-			cb.Note(e.i18n.T(MsgAskQuestionNoteMulti))
+			cb.Note(e.i18n.T(MsgAskQuestionInputNote))
+		} else if q.MultiSelect {
+			// Rich-card platforms can keep every long option visible while native
+			// checkers toggle locally. A single form submit avoids per-tap message
+			// edits and lets the platform replace the card only after confirmation.
+			cb.Markdown(body)
+			options := make([]CardMultiSelectOption, 0, len(q.Options))
+			for i, opt := range q.Options {
+				displayLabel := optionLabelWithoutMatchingOrdinal(opt.Label, i+1)
+				text := fmt.Sprintf("**%d. %s**", i+1, displayLabel)
+				if opt.Description != "" {
+					text += "\n" + opt.Description
+				}
+				options = append(options, CardMultiSelectOption{Text: text, Value: strconv.Itoa(i + 1)})
+			}
+			extra := map[string]string{
+				"askq_question": q.Question,
+				"askq_answered": e.i18n.T(MsgAskQuestionAnswered),
+			}
+			if requestID != "" {
+				extra["askq_request_id"] = requestID
+			}
+			cb.MultiSelect(options, e.i18n.T(MsgAskQuestionSubmit), fmt.Sprintf("askq:%d:multi", qIdx), extra)
+			cb.Note(e.i18n.T(MsgAskQuestionMultiCardNote))
 		} else {
+			// Render each option once as a selectable content block. Feishu maps
+			// this to a Card 2.0 interactive_container, so long text wraps at the
+			// full card width and the user can tap anywhere in the block instead
+			// of relying on a narrow, truncated button label.
 			cb.Markdown(body)
 			for i, opt := range q.Options {
-				desc := opt.Label
+				displayLabel := optionLabelWithoutMatchingOrdinal(opt.Label, i+1)
+				text := fmt.Sprintf("**%d. %s**", i+1, displayLabel)
 				if opt.Description != "" {
-					desc += " — " + opt.Description
+					text += "\n" + opt.Description
 				}
 				answerData := fmt.Sprintf("askq:%d:%d", qIdx, i+1)
-				cb.ListItemBtnExtra(desc, opt.Label, "default", answerData, map[string]string{
+				extra := map[string]string{
 					"askq_label":    opt.Label,
 					"askq_question": q.Question,
-				})
+					"askq_answered": e.i18n.T(MsgAskQuestionAnswered),
+				}
+				if requestID != "" {
+					extra["askq_request_id"] = requestID
+				}
+				cb.Choice(text, opt.Label, answerData, extra)
 			}
-			cb.Note(e.i18n.T(MsgAskQuestionNote))
+			cb.Note(e.i18n.T(MsgAskQuestionChoiceNote))
 		}
 		e.sendWithCard(p, replyCtx, cb.Build())
 		return
@@ -11843,6 +11973,17 @@ func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []Use
 		textBuf.WriteString(q.Question)
 		textBuf.WriteString("*")
 		textBuf.WriteString(titleSuffix)
+		if len(q.Options) == 0 {
+			if q.Placeholder != "" {
+				textBuf.WriteString("\n\n_")
+				textBuf.WriteString(q.Placeholder)
+				textBuf.WriteString("_")
+			}
+			textBuf.WriteString("\n\n")
+			textBuf.WriteString(e.i18n.T(MsgAskQuestionInputNote))
+			e.send(p, replyCtx, textBuf.String())
+			return
+		}
 		if q.MultiSelect {
 			textBuf.WriteString(e.i18n.T(MsgAskQuestionMulti))
 		}
@@ -11883,19 +12024,28 @@ func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []Use
 	sb.WriteString(q.Question)
 	sb.WriteString("**")
 	sb.WriteString(titleSuffix)
-	if q.MultiSelect {
-		sb.WriteString(e.i18n.T(MsgAskQuestionMulti))
-	}
-	sb.WriteString("\n\n")
-	for i, opt := range q.Options {
-		sb.WriteString(fmt.Sprintf("%d. **%s**", i+1, opt.Label))
-		if opt.Description != "" {
-			sb.WriteString(" — ")
-			sb.WriteString(opt.Description)
+	if len(q.Options) == 0 {
+		if q.Placeholder != "" {
+			sb.WriteString("\n\n> ")
+			sb.WriteString(q.Placeholder)
 		}
-		sb.WriteString("\n")
+		sb.WriteString("\n\n")
+		sb.WriteString(e.i18n.T(MsgAskQuestionInputNote))
+	} else {
+		if q.MultiSelect {
+			sb.WriteString(e.i18n.T(MsgAskQuestionMulti))
+		}
+		sb.WriteString("\n\n")
+		for i, opt := range q.Options {
+			sb.WriteString(fmt.Sprintf("%d. **%s**", i+1, opt.Label))
+			if opt.Description != "" {
+				sb.WriteString(" — ")
+				sb.WriteString(opt.Description)
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString(fmt.Sprintf("\n%s", e.i18n.T(MsgAskQuestionNote)))
 	}
-	sb.WriteString(fmt.Sprintf("\n%s", e.i18n.T(MsgAskQuestionNote)))
 	e.send(p, replyCtx, sb.String())
 }
 
@@ -11966,6 +12116,17 @@ func (e *Engine) renderCardForPlatformWorkspace(p Platform, card *Card, workspac
 				BtnType:  v.BtnType,
 				BtnValue: v.BtnValue,
 				Extra:    v.Extra,
+			})
+		case CardChoice:
+			text := v.Text
+			if workspaceDir != "" {
+				text = e.renderOutgoingContentForWorkspace(p, v.Text, workspaceDir)
+			}
+			out.Elements = append(out.Elements, CardChoice{
+				Text:       text,
+				ButtonText: v.ButtonText,
+				Value:      v.Value,
+				Extra:      v.Extra,
 			})
 		default:
 			out.Elements = append(out.Elements, elem)
