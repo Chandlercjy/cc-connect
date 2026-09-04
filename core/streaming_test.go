@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -255,6 +256,82 @@ func TestStreamPreview_DiscardDeletesPreview(t *testing.T) {
 	}
 	if len(msgs) != 1 || msgs[0] != "start:Hello World" {
 		t.Fatalf("messages = %#v, want only initial preview", msgs)
+	}
+}
+
+type mockPreviewFinalizerPlatform struct {
+	mockUpdaterPlatform
+	finalizeCalls  int
+	finalizeReply  any
+	finalizeHandle any
+	finalizeBody   string
+	finalizeFooter string
+}
+
+func (m *mockPreviewFinalizerPlatform) FinalizePreview(_ context.Context, replyCtx, previewHandle any, finalText, statusFooter string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.finalizeCalls++
+	m.finalizeReply = replyCtx
+	m.finalizeHandle = previewHandle
+	m.finalizeBody = finalText
+	m.finalizeFooter = statusFooter
+	return true, nil
+}
+
+func TestStreamPreview_FinishPrefersPlatformFinalizer(t *testing.T) {
+	mp := &mockPreviewFinalizerPlatform{}
+	cfg := StreamPreviewCfg{
+		Enabled:       true,
+		IntervalMs:    50,
+		MinDeltaChars: 1,
+		MaxChars:      500,
+	}
+
+	sp := newStreamPreview(cfg, mp, "original-reply", context.Background(), nil)
+	sp.appendText("first frame")
+	time.Sleep(100 * time.Millisecond)
+
+	if ok := sp.finish("final body", "status footer"); !ok {
+		t.Fatal("finish should return true when PreviewFinalizer succeeds")
+	}
+
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+	if mp.finalizeCalls != 1 {
+		t.Fatalf("FinalizePreview calls = %d, want 1", mp.finalizeCalls)
+	}
+	if mp.finalizeReply != "original-reply" || mp.finalizeHandle != "preview-handle" {
+		t.Fatalf("FinalizePreview contexts = (%#v, %#v), want original reply and preview handle", mp.finalizeReply, mp.finalizeHandle)
+	}
+	if mp.finalizeBody != "final body" || mp.finalizeFooter != "status footer" {
+		t.Fatalf("FinalizePreview payload = (%q, %q), want final body/footer", mp.finalizeBody, mp.finalizeFooter)
+	}
+	if len(mp.messages) != 1 || mp.messages[0] != "start:first frame" {
+		t.Fatalf("messages = %#v, finalizer should bypass generic UpdateMessage", mp.messages)
+	}
+}
+
+type mockFinalizerFailurePlatform struct {
+	mockUpdaterPlatform
+}
+
+func (m *mockFinalizerFailurePlatform) FinalizePreview(context.Context, any, any, string, string) (bool, error) {
+	return false, errors.New("platform fallback failed")
+}
+
+func TestStreamPreview_FinishReturnsFalseWithoutUpdatingFailedFinalizerHandle(t *testing.T) {
+	mp := &mockFinalizerFailurePlatform{}
+	cfg := StreamPreviewCfg{Enabled: true, IntervalMs: 50, MinDeltaChars: 1, MaxChars: 500}
+	sp := newStreamPreview(cfg, mp, "reply", context.Background(), nil)
+	sp.appendText("first frame")
+	time.Sleep(100 * time.Millisecond)
+
+	if ok := sp.finish("final body", ""); ok {
+		t.Fatal("finish should return false so the engine performs a complete generic send")
+	}
+	if messages := mp.getMessages(); len(messages) != 1 || messages[0] != "start:first frame" {
+		t.Fatalf("messages = %#v, failed finalizer handle must not receive another UpdateMessage", messages)
 	}
 }
 

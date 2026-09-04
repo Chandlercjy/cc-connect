@@ -132,6 +132,16 @@ type PreviewStarter interface {
 	SendPreviewStart(ctx context.Context, replyCtx any, content string) (previewHandle any, err error)
 }
 
+// PreviewFinalizer is an optional interface for platforms that need to own the
+// final preview update and any platform-specific fallback delivery. handled is
+// true only when the complete final response was delivered successfully. A
+// false result with a non-nil error makes finish return false immediately so
+// the engine can perform its generic complete send without touching the failed
+// preview handle again.
+type PreviewFinalizer interface {
+	FinalizePreview(ctx context.Context, replyCtx, previewHandle any, finalText, statusFooter string) (handled bool, err error)
+}
+
 // PreviewCleaner is an optional interface for platforms that need to clean up
 // the preview message after the final response is sent (e.g. Discord deletes
 // the preview and sends a fresh message).
@@ -139,8 +149,13 @@ type PreviewCleaner interface {
 	DeletePreviewMessage(ctx context.Context, previewHandle any) error
 }
 
-// PreviewFinishPreference is an optional interface for platforms that want to
-// keep the preview message as the final delivered message on normal completion.
+// PreviewHandleFinishPreference is an optional interface for platforms whose
+// finish preference depends on the concrete preview handle kind.
+type PreviewHandleFinishPreference interface {
+	KeepPreviewOnFinish(previewHandle any) bool
+}
+
+// PreviewFinishPreference is the legacy handle-independent finish preference.
 type PreviewFinishPreference interface {
 	KeepPreviewOnFinish() bool
 }
@@ -415,6 +430,20 @@ func (sp *streamPreview) finish(finalText, statusFooter string) bool {
 	if sp.transform != nil {
 		finalText = sp.transform(finalText)
 	}
+	if sp.previewMsgID != nil && finalText != "" {
+		if finalizer, ok := sp.platform.(PreviewFinalizer); ok {
+			handled, err := finalizer.FinalizePreview(sp.ctx, sp.replyCtx, sp.previewMsgID, finalText, statusFooter)
+			if err != nil {
+				slog.Warn("stream preview finish: platform finalizer failed", "error", err, "handled", handled)
+				if !handled {
+					return false
+				}
+			}
+			if handled {
+				return true
+			}
+		}
+	}
 	if sp.previewMsgID == nil || sp.degraded {
 		if sp.previewMsgID != nil && sp.degraded {
 			// Try to recover degraded preview via UpdateMessage before falling back to delete
@@ -442,7 +471,9 @@ func (sp *streamPreview) finish(finalText, statusFooter string) bool {
 	}
 
 	keepPreview := false
-	if pref, ok := sp.platform.(PreviewFinishPreference); ok {
+	if pref, ok := sp.platform.(PreviewHandleFinishPreference); ok {
+		keepPreview = pref.KeepPreviewOnFinish(sp.previewMsgID)
+	} else if pref, ok := sp.platform.(PreviewFinishPreference); ok {
 		keepPreview = pref.KeepPreviewOnFinish()
 	}
 
