@@ -118,6 +118,55 @@ func TestNew_ProgressStyleRejectsInvalidValue(t *testing.T) {
 	}
 }
 
+func TestNew_OrdinaryMessageModeDefaultsLegacyAndAcceptsHermes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts map[string]any
+		want string
+	}{
+		{
+			name: "default",
+			opts: map[string]any{"app_id": "cli_xxx", "app_secret": "secret"},
+			want: "legacy",
+		},
+		{
+			name: "hermes normalized",
+			opts: map[string]any{"app_id": "cli_xxx", "app_secret": "secret", "ordinary_message_mode": " HERMES "},
+			want: "hermes",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := New(tc.opts)
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			base := extractBasePlatform(p)
+			if base == nil {
+				t.Fatalf("platform type = %T, want Feishu platform", p)
+			}
+			if base.ordinaryMessageMode != tc.want {
+				t.Fatalf("ordinaryMessageMode = %q, want %q", base.ordinaryMessageMode, tc.want)
+			}
+		})
+	}
+}
+
+func TestNew_OrdinaryMessageModeRejectsInvalidValue(t *testing.T) {
+	for _, value := range []any{"", "future", 1} {
+		_, err := New(map[string]any{
+			"app_id":                "cli_xxx",
+			"app_secret":            "secret",
+			"ordinary_message_mode": value,
+		})
+		if err == nil {
+			t.Fatalf("expected error for invalid ordinary_message_mode %v", value)
+		}
+		if !strings.Contains(err.Error(), "invalid ordinary_message_mode") {
+			t.Fatalf("error = %q, want invalid ordinary_message_mode", err.Error())
+		}
+	}
+}
+
 func TestDetectFeishuFileMessageType(t *testing.T) {
 	tests := []struct {
 		name     string

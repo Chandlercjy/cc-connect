@@ -120,6 +120,7 @@ type Platform struct {
 	appID                      string
 	appSecret                  string
 	progressStyle              string
+	ordinaryMessageMode        string
 	useInteractiveCard         bool
 	self                       core.Platform
 	reactionEmoji              string
@@ -410,6 +411,21 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 			return nil, fmt.Errorf("%s: invalid progress_style %q (want legacy, compact, or card)", name, v)
 		}
 	}
+	ordinaryMessageMode := ordinaryMessageModeLegacy
+	if raw, exists := opts["ordinary_message_mode"]; exists {
+		v, ok := raw.(string)
+		if !ok {
+			return nil, fmt.Errorf("%s: invalid ordinary_message_mode %v (want legacy or hermes)", name, raw)
+		}
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case ordinaryMessageModeLegacy:
+			ordinaryMessageMode = ordinaryMessageModeLegacy
+		case ordinaryMessageModeHermes:
+			ordinaryMessageMode = ordinaryMessageModeHermes
+		default:
+			return nil, fmt.Errorf("%s: invalid ordinary_message_mode %q (want legacy or hermes)", name, v)
+		}
+	}
 	useInteractiveCard := true
 	if v, ok := opts["enable_feishu_card"].(bool); ok {
 		useInteractiveCard = v
@@ -470,6 +486,7 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		appID:                      appID,
 		appSecret:                  appSecret,
 		progressStyle:              progressStyle,
+		ordinaryMessageMode:        ordinaryMessageMode,
 		useInteractiveCard:         useInteractiveCard,
 		reactionEmoji:              reactionEmoji,
 		doneEmoji:                  doneEmoji,
@@ -545,7 +562,14 @@ func (p *Platform) getBotOpenID() string {
 	return p.botOpenID
 }
 
-func (p *Platform) KeepPreviewOnFinish() bool {
+func (p *Platform) KeepPreviewOnFinish(previewHandle any) bool {
+	h, ok := previewHandle.(*feishuPreviewHandle)
+	if !ok {
+		return false
+	}
+	if h.kind == feishuPreviewKindOrdinary {
+		return true
+	}
 	return p.useInteractiveCard
 }
 
@@ -3206,6 +3230,9 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 	}
 
 	content = p.resolveMentionsInContent(ctx, rc.chatID, content)
+	if p.hermesOrdinaryMessagesEnabled() {
+		return p.sendHermesMessage(ctx, rc, content)
+	}
 	msgType, msgBody := buildReplyContent(content)
 
 	if !p.shouldUseThreadOrReplyAPI(rc) {
@@ -3228,16 +3255,17 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 	}
 
 	content = p.resolveMentionsInContent(ctx, rc.chatID, content)
+	if p.hermesOrdinaryMessagesEnabled() {
+		return p.sendHermesMessage(ctx, rc, content)
+	}
 	msgType, msgBody := buildReplyContent(content)
 	return p.sendNewMessageToChat(ctx, rc, msgType, msgBody)
 }
 
-// SendWithStatusFooter implements core.StatusFooterSender: send a reply with
-// the body content followed by a small/dim status-footer block. Always uses
-// the interactive card path so the footer can render with text_size:
-// "notation". Falls back to plain Send when the footer is empty or the content
-// contains a resolved @mention (Feishu only fires mention events for <at> tags
-// inside MsgTypeText, not inside cards).
+// SendWithStatusFooter implements core.StatusFooterSender. Legacy mode uses an
+// interactive card so the footer can render with text_size "notation". Hermes
+// ordinary messages keep the footer inline in text/post; functional card
+// payloads remain cards. Resolved mentions use text so Feishu emits notices.
 func (p *Platform) SendWithStatusFooter(ctx context.Context, rctx any, content, footer string) error {
 	rc, ok := rctx.(replyContext)
 	if !ok {
@@ -3245,6 +3273,11 @@ func (p *Platform) SendWithStatusFooter(ctx context.Context, rctx any, content, 
 	}
 	// Resolve mentions first so we can detect whether a real @mention is
 	content = p.resolveMentionsInContent(ctx, rc.chatID, content)
+	if p.hermesOrdinaryMessagesEnabled() {
+		if ordinaryContent, isCard := hermesCardOrdinaryFallback(content); !isCard || !p.useInteractiveCard {
+			return p.sendHermesMessage(ctx, rc, appendOrdinaryStatusFooter(ordinaryContent, footer))
+		}
+	}
 	if strings.TrimSpace(footer) == "" || strings.Contains(content, `<at user_id=`) || strings.Contains(content, `<at id=`) {
 		if strings.TrimSpace(footer) != "" {
 			content += "\n\n" + footer
@@ -4491,8 +4524,9 @@ func isThreadSessionKey(sessionKey string) bool {
 	return ok
 }
 
-// feishuPreviewHandle stores the message ID for an editable preview message.
-// Card 2.0 path needs mu/status/lastContent to let SetPreviewStatus patch
+// feishuPreviewHandle stores the typed message kind and ID for an editable
+// ordinary post or interactive-card preview. Card 2.0 path needs
+// mu/status/lastContent to let SetPreviewStatus patch
 // the header color without re-rendering the whole card.
 //
 // Card 2.0 + cardkit-v1 streaming text path additionally needs cardID and a
@@ -4501,13 +4535,19 @@ func isThreadSessionKey(sessionKey string) bool {
 // Entity failed → fallback), in which case streamRichCardText must NOT be
 // called and the engine falls back to full-card Patch via UpdateMessage.
 type feishuPreviewHandle struct {
-	mu          sync.Mutex
-	messageID   string
-	chatID      string
-	cardID      string // cardkit-v1 entity id (empty = no streaming text path)
-	sequence    int    // cardkit-v1 streaming text monotonic counter (++ before use; first call = 1)
-	status      core.CardStatus
-	lastContent string
+	mu                     sync.Mutex
+	kind                   feishuPreviewKind
+	messageID              string
+	chatID                 string
+	msgType                string
+	cardID                 string // cardkit-v1 entity id (empty = no streaming text path)
+	sequence               int    // cardkit-v1 streaming text monotonic counter (++ before use; first call = 1)
+	status                 core.CardStatus
+	lastContent            string
+	ordinarySuccessfulPUTs int
+	ordinaryFinalizing     chan struct{}
+	ordinaryFinalized      bool
+	ordinaryFinalizeErr    error
 }
 
 // buildCardJSON builds a Feishu interactive card JSON string with a markdown element.
@@ -5035,9 +5075,9 @@ func buildPreviewCardJSON(content string) string {
 	return buildCardJSON(sanitizeMarkdownURLs(content))
 }
 
-// SendPreviewStart sends a new card message and returns a handle for subsequent edits.
-// Using card (interactive) type for both preview and final message so updates
-// are in-place without needing to delete and resend.
+// SendPreviewStart sends an editable preview and returns a typed handle for
+// subsequent edits. Hermes ordinary previews use post messages; interactive
+// payloads and legacy mode keep the existing card path below.
 //
 // Card 2.0 + cardkit-v1 path (when content is a rich card JSON and we're NOT
 // in thread/reply mode): runs a two-step flow that captures a card_id usable
@@ -5053,10 +5093,6 @@ func buildPreviewCardJSON(content string) string {
 // cardID stays empty in that case and the engine routes EventText through the
 // full-card Patch path (= original #657 behavior, no typewriter).
 func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content string) (any, error) {
-	if !p.useInteractiveCard {
-		return nil, core.ErrNotSupported
-	}
-
 	rc, ok := rctx.(replyContext)
 	if !ok {
 		return nil, fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
@@ -5065,6 +5101,12 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 	chatID := rc.chatID
 	if chatID == "" {
 		return nil, fmt.Errorf("%s: chatID is empty", p.tag())
+	}
+	if p.hermesOrdinaryMessagesEnabled() && !isInteractivePreviewContent(content) {
+		return p.sendOrdinaryPreviewStart(ctx, rc, content)
+	}
+	if !p.useInteractiveCard {
+		return nil, core.ErrNotSupported
 	}
 
 	// Card 2.0 path: engine passes a pre-built rich card JSON; pass it through.
@@ -5149,7 +5191,13 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 		return nil, fmt.Errorf("%s: send preview: no message ID returned", p.tag())
 	}
 
-	return &feishuPreviewHandle{messageID: msgID, chatID: chatID, cardID: cardID}, nil
+	return &feishuPreviewHandle{
+		kind:      feishuPreviewKindCard,
+		messageID: msgID,
+		chatID:    chatID,
+		msgType:   larkim.MsgTypeInteractive,
+		cardID:    cardID,
+	}, nil
 }
 
 // createCardEntity calls the cardkit-v1 Create Card Entity API
@@ -5208,6 +5256,9 @@ func (p *Platform) StreamRichCardText(ctx context.Context, previewHandle any, fu
 	if !ok {
 		return fmt.Errorf("%s: StreamRichCardText: invalid preview handle type %T", p.tag(), previewHandle)
 	}
+	if h.kind == feishuPreviewKindOrdinary {
+		return core.ErrNotSupported
+	}
 
 	// Serialize all PUTs for one card so the monotonic sequence counter is
 	// preserved across concurrent EventText calls; rate-limit headroom is
@@ -5256,16 +5307,18 @@ func (p *Platform) StreamRichCardText(ctx context.Context, previewHandle any, fu
 	return nil
 }
 
-// UpdateMessage edits an existing card message identified by previewHandle.
-// Uses the Patch API (HTTP PATCH) which is required for interactive card messages.
+// UpdateMessage edits the message identified by previewHandle. Hermes ordinary
+// posts use Im.Message.Update (PUT); interactive cards keep the Patch/CardKit path.
 func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content string) error {
-	if !p.useInteractiveCard {
-		return core.ErrNotSupported
-	}
-
 	h, ok := previewHandle.(*feishuPreviewHandle)
 	if !ok {
 		return fmt.Errorf("%s: invalid preview handle type %T", p.tag(), previewHandle)
+	}
+	if h.kind == feishuPreviewKindOrdinary {
+		return p.updateOrdinaryPreview(ctx, h, content, false)
+	}
+	if !p.useInteractiveCard {
+		return core.ErrNotSupported
 	}
 
 	cardJSON := ""
@@ -5296,20 +5349,22 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
 	return p.patchCardMessage(ctx, h.messageID, cardJSON)
 }
 
-// UpdateMessageWithStatusFooter implements core.StatusFooterUpdater: edit an
-// existing card to render the body markdown plus a small/dim status-footer
-// block (Lark `text_size: "notation"`). Falls through to UpdateMessage when
-// the footer is empty.
+// UpdateMessageWithStatusFooter implements core.StatusFooterUpdater. Ordinary
+// previews keep the footer inline in the post; cards render a small/dim footer
+// block (Lark `text_size: "notation"`).
 func (p *Platform) UpdateMessageWithStatusFooter(ctx context.Context, previewHandle any, content, footer string) error {
+	h, ok := previewHandle.(*feishuPreviewHandle)
+	if !ok {
+		return fmt.Errorf("%s: invalid preview handle type %T", p.tag(), previewHandle)
+	}
+	if h.kind == feishuPreviewKindOrdinary {
+		return p.updateOrdinaryPreview(ctx, h, appendOrdinaryStatusFooter(content, footer), false)
+	}
 	if !p.useInteractiveCard {
 		return core.ErrNotSupported
 	}
 	if strings.TrimSpace(footer) == "" {
 		return p.UpdateMessage(ctx, previewHandle, content)
-	}
-	h, ok := previewHandle.(*feishuPreviewHandle)
-	if !ok {
-		return fmt.Errorf("%s: invalid preview handle type %T", p.tag(), previewHandle)
 	}
 	// Mirror UpdateMessage's existing behavior: it does not resolve
 	// @mentions on the card-edit path either. SendWithStatusFooter does
@@ -5429,29 +5484,28 @@ func (p *Platform) Stop() error {
 	return nil
 }
 
-// DeletePreviewMessage removes a preview message so the caller can send a
-// separate final message without leaving a stale interactive card behind.
+// DeletePreviewMessage removes an ordinary or card preview so the caller can
+// send a separate final message without leaving stale partial content behind.
 func (p *Platform) DeletePreviewMessage(ctx context.Context, previewHandle any) error {
-	if !p.useInteractiveCard {
-		return core.ErrNotSupported
-	}
-
 	h, ok := previewHandle.(*feishuPreviewHandle)
 	if !ok {
 		return fmt.Errorf("%s: invalid preview handle type %T", p.tag(), previewHandle)
 	}
+	return p.deleteMessageByID(ctx, h.messageID, "delete preview message")
+}
 
+func (p *Platform) deleteMessageByID(ctx context.Context, messageID, operation string) error {
 	req := larkim.NewDeleteMessageReqBuilder().
-		MessageId(h.messageID).
+		MessageId(messageID).
 		Build()
-	return p.withTransientRetry(ctx, "delete preview message", func() error {
-		return p.withFreshTenantAccessTokenRetry(ctx, "delete preview message", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
+	return p.withTransientRetry(ctx, operation, func() error {
+		return p.withFreshTenantAccessTokenRetry(ctx, operation, func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			resp, err := client.Im.Message.Delete(ctx, req, options...)
 			if err != nil {
-				return fmt.Errorf("%s: delete preview message: %w", p.tag(), err)
+				return fmt.Errorf("%s: %s: %w", p.tag(), operation, err)
 			}
 			if !resp.Success() {
-				return fmt.Errorf("%s: delete preview message code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
+				return fmt.Errorf("%s: %s code=%d msg=%s", p.tag(), operation, resp.Code, resp.Msg)
 			}
 			return nil
 		})
@@ -6430,18 +6484,25 @@ func (p *Platform) ResolveRichCardMarkdown(ctx context.Context, markdown string,
 	pending := map[*richCardImageUpload]struct{}{}
 	resolved := p.replaceRichCardMarkdownImages(ctx, markdown, pending)
 	if final && len(pending) > 0 {
-		waitCtx, cancel := context.WithTimeout(ctx, richCardImageFinalWait)
-		defer cancel()
-		for upload := range pending {
-			select {
-			case <-upload.done:
-			case <-waitCtx.Done():
-				return p.replaceRichCardMarkdownImages(ctx, markdown, nil)
-			}
-		}
+		waitForRichCardImageUploads(ctx, pending)
 		resolved = p.replaceRichCardMarkdownImages(ctx, markdown, nil)
 	}
 	return resolved
+}
+
+func waitForRichCardImageUploads(ctx context.Context, pending map[*richCardImageUpload]struct{}) {
+	if len(pending) == 0 {
+		return
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, richCardImageFinalWait)
+	defer cancel()
+	for upload := range pending {
+		select {
+		case <-upload.done:
+		case <-waitCtx.Done():
+			return
+		}
+	}
 }
 
 func (p *Platform) replaceRichCardMarkdownImages(ctx context.Context, markdown string, pending map[*richCardImageUpload]struct{}) string {
@@ -6919,13 +6980,42 @@ func richStepBody(step core.ToolStep) string {
 	return strings.Join(lines, "\n")
 }
 
-// isCardJSON returns true if content looks like a complete Feishu card JSON
-// (has "schema" and "body"). Used to avoid double-wrapping rich card output.
+// isCardJSON preserves the legacy heuristic used by existing card paths.
 func isCardJSON(content string) bool {
 	if len(content) < 10 || content[0] != '{' {
 		return false
 	}
 	return strings.Contains(content, `"schema"`) && strings.Contains(content, `"body"`)
+}
+
+// isHermesCardJSON accepts only a structurally valid Feishu Card 2.0 payload.
+// The stricter opt-in check avoids routing ordinary JSON-like model output
+// through the interactive-message API without changing legacy behavior.
+func isHermesCardJSON(content string) bool {
+	var card map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(content), &card); err != nil {
+		return false
+	}
+
+	var schema string
+	if err := json.Unmarshal(card["schema"], &schema); err != nil || schema != "2.0" {
+		return false
+	}
+
+	bodyJSON := bytes.TrimSpace(card["body"])
+	if len(bodyJSON) == 0 || bodyJSON[0] != '{' {
+		return false
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(bodyJSON, &body); err != nil {
+		return false
+	}
+	elementsJSON := bytes.TrimSpace(body["elements"])
+	if len(elementsJSON) == 0 || elementsJSON[0] != '[' {
+		return false
+	}
+	var elements []json.RawMessage
+	return json.Unmarshal(elementsJSON, &elements) == nil
 }
 
 // buildCardJSONWithStatus builds a Feishu card JSON with a colored header
@@ -7302,7 +7392,7 @@ func (p *Platform) SplitMarkdownByTables(md string, maxTables int) []string {
 // SetPreviewStatus updates the card header color to reflect the agent's current state.
 func (p *Platform) SetPreviewStatus(previewHandle any, status core.CardStatus) {
 	h, ok := previewHandle.(*feishuPreviewHandle)
-	if !ok {
+	if !ok || h.kind == feishuPreviewKindOrdinary {
 		return
 	}
 
