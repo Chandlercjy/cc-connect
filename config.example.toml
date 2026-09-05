@@ -1010,10 +1010,10 @@ type = "feishu"
 app_id = "your-feishu-app-id"
 app_secret = "your-feishu-app-secret"
 # domain = "https://open.feishu.cn"  # Optional runtime API/WebSocket base URL override / 可选：运行时 API/WebSocket 域名覆盖
-# enable_feishu_card = true  # Feishu interactive-card capability (default: true); Hermes text/post does not require it
-#                              # 飞书交互卡片能力（默认 true）；Hermes 普通 text/post 不依赖此开关
-# ordinary_message_mode = "legacy"  # legacy | hermes; hermes uses editable post messages for ordinary streaming replies
-#                                      # legacy | hermes；hermes 对普通流式回复使用可编辑富文本消息
+# enable_feishu_card = true  # Feishu interactive-card capability (default: true); plain text/post does not require it
+#                              # 飞书交互卡片能力（默认 true）；plain 普通 text/post 不依赖此开关
+# ordinary_message_mode = "legacy"  # legacy | plain; plain uses editable post messages for ordinary streaming replies
+#                                      # legacy | plain；plain 对普通流式回复使用可编辑富文本消息；旧值 hermes 不再接受
 # allow_from = "*"          # Allowed user open_ids, comma-separated; "*" = all (default). Use /whoami to get your open_id.
 #                              # 允许的用户 open_id，逗号分隔；"*" 表示所有（默认）。发送 /whoami 获取你的 open_id。
 # allow_chat = "*"          # Allowed group chat_ids, comma-separated; "*" = all (default). Find chat_id in group settings.
@@ -1080,7 +1080,7 @@ app_secret = "your-feishu-app-secret"
 # callback_path = "/feishu/webhook"  # Webhook callback path / Webhook 回调路径
 # encrypt_key = ""               # Event encrypt key (optional) / 事件加密密钥（可选）
 # enable_feishu_card = true
-# ordinary_message_mode = "legacy"  # legacy | hermes
+# ordinary_message_mode = "legacy"  # legacy | plain; old value hermes is rejected / 不再接受旧值 hermes
 # allow_from = "*"
 # reaction_emoji = "OnIt"
 # done_emoji = "none"

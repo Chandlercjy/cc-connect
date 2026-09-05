@@ -417,15 +417,15 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	if raw, exists := opts["ordinary_message_mode"]; exists {
 		v, ok := raw.(string)
 		if !ok {
-			return nil, fmt.Errorf("%s: invalid ordinary_message_mode %v (want legacy or hermes)", name, raw)
+			return nil, fmt.Errorf("%s: invalid ordinary_message_mode %v (want legacy or plain)", name, raw)
 		}
 		switch strings.ToLower(strings.TrimSpace(v)) {
 		case ordinaryMessageModeLegacy:
 			ordinaryMessageMode = ordinaryMessageModeLegacy
-		case ordinaryMessageModeHermes:
-			ordinaryMessageMode = ordinaryMessageModeHermes
+		case ordinaryMessageModePlain:
+			ordinaryMessageMode = ordinaryMessageModePlain
 		default:
-			return nil, fmt.Errorf("%s: invalid ordinary_message_mode %q (want legacy or hermes)", name, v)
+			return nil, fmt.Errorf("%s: invalid ordinary_message_mode %q (want legacy or plain)", name, v)
 		}
 	}
 	useInteractiveCard := true
@@ -3270,8 +3270,8 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 	}
 
 	content = p.resolveMentionsInContent(ctx, rc.chatID, content)
-	if p.hermesOrdinaryMessagesEnabled() {
-		return p.sendHermesMessage(ctx, rc, content)
+	if p.plainOrdinaryMessagesEnabled() {
+		return p.sendPlainMessage(ctx, rc, content)
 	}
 	msgType, msgBody := buildReplyContent(content)
 
@@ -3295,15 +3295,15 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 	}
 
 	content = p.resolveMentionsInContent(ctx, rc.chatID, content)
-	if p.hermesOrdinaryMessagesEnabled() {
-		return p.sendHermesMessage(ctx, rc, content)
+	if p.plainOrdinaryMessagesEnabled() {
+		return p.sendPlainMessage(ctx, rc, content)
 	}
 	msgType, msgBody := buildReplyContent(content)
 	return p.sendNewMessageToChat(ctx, rc, msgType, msgBody)
 }
 
 // SendWithStatusFooter implements core.StatusFooterSender. Legacy mode uses an
-// interactive card so the footer can render with text_size "notation". Hermes
+// interactive card so the footer can render with text_size "notation". Plain
 // ordinary messages keep the footer inline in text/post; functional card
 // payloads remain cards. Resolved mentions use text so Feishu emits notices.
 func (p *Platform) SendWithStatusFooter(ctx context.Context, rctx any, content, footer string) error {
@@ -3313,9 +3313,9 @@ func (p *Platform) SendWithStatusFooter(ctx context.Context, rctx any, content, 
 	}
 	// Resolve mentions first so we can detect whether a real @mention is
 	content = p.resolveMentionsInContent(ctx, rc.chatID, content)
-	if p.hermesOrdinaryMessagesEnabled() {
+	if p.plainOrdinaryMessagesEnabled() {
 		if ordinaryContent, isCard := hermesCardOrdinaryFallback(content); !isCard || !p.useInteractiveCard {
-			return p.sendHermesMessage(ctx, rc, appendOrdinaryStatusFooter(ordinaryContent, footer))
+			return p.sendPlainMessage(ctx, rc, appendOrdinaryStatusFooter(ordinaryContent, footer))
 		}
 	}
 	if strings.TrimSpace(footer) == "" || strings.Contains(content, `<at user_id=`) || strings.Contains(content, `<at id=`) {
@@ -5143,7 +5143,7 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 	if chatID == "" {
 		return nil, fmt.Errorf("%s: chatID is empty", p.tag())
 	}
-	if p.hermesOrdinaryMessagesEnabled() && !isInteractivePreviewContent(content) {
+	if p.plainOrdinaryMessagesEnabled() && !isInteractivePreviewContent(content) {
 		return p.sendOrdinaryPreviewStart(ctx, rc, content)
 	}
 	if !p.useInteractiveCard {

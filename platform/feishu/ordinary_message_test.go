@@ -223,7 +223,7 @@ func newOrdinaryMessageTestPlatform(t *testing.T, useCards bool, recorder *ordin
 		domain:              srv.URL,
 		appID:               appID,
 		appSecret:           appSecret,
-		ordinaryMessageMode: "hermes",
+		ordinaryMessageMode: "plain",
 		useInteractiveCard:  useCards,
 		client: lark.NewClient(appID, appSecret,
 			lark.WithOpenBaseUrl(srv.URL),
@@ -236,6 +236,78 @@ func newOrdinaryMessageTestPlatform(t *testing.T, useCards bool, recorder *ordin
 		),
 	}
 	return p, srv.Close
+}
+
+// Exercise the public constructor and SDK HTTP transport, not a manually set
+// mode: normalized plain values must deliver ordinary replies and preview PUTs.
+func TestNew_PlainDeliversRepliesAndPreviews(t *testing.T) {
+	for _, useCards := range []bool{true, false} {
+		for _, mode := range []string{"plain", " PLAIN "} {
+			t.Run(fmt.Sprintf("cards=%t/mode=%s", useCards, mode), func(t *testing.T) {
+				recorder := &ordinaryMessageRecorder{}
+				fixture, closeServer := newOrdinaryMessageTestPlatform(t, useCards, recorder)
+				defer closeServer()
+				platform, err := New(map[string]any{
+					"app_id": fixture.appID, "app_secret": fixture.appSecret,
+					"domain": fixture.domain, "ordinary_message_mode": mode,
+					"enable_feishu_card": useCards,
+				})
+				if err != nil {
+					t.Fatalf("New() error = %v", err)
+				}
+				ctx := context.Background()
+				rc := replyContext{messageID: "om_trigger", chatID: "oc_chat"}
+				for _, content := range []string{"plain reply", "**markdown reply**"} {
+					if err := platform.Reply(ctx, rc, content); err != nil {
+						t.Fatalf("Reply() error = %v", err)
+					}
+				}
+				preview := platform.(core.MessageUpdater)
+				handle, err := platform.(core.PreviewStarter).SendPreviewStart(ctx, rc, "first frame")
+				if err != nil {
+					t.Fatalf("SendPreviewStart() error = %v", err)
+				}
+				if err := preview.UpdateMessage(ctx, handle, "second **frame**"); err != nil {
+					t.Fatalf("UpdateMessage() error = %v", err)
+				}
+				handled, err := platform.(core.PreviewFinalizer).FinalizePreview(ctx, rc, handle, "final **answer**", "status footer")
+				if err != nil || !handled {
+					t.Fatalf("FinalizePreview() = %v, %v", handled, err)
+				}
+
+				requests := recorder.snapshot()
+				wants := []struct{ method, path, msgType, text string }{
+					{http.MethodPost, "/open-apis/im/v1/messages/om_trigger/reply", "text", "plain reply"},
+					{http.MethodPost, "/open-apis/im/v1/messages/om_trigger/reply", "post", "**markdown reply**"},
+					{http.MethodPost, "/open-apis/im/v1/messages/om_trigger/reply", "post", "first frame"},
+					{http.MethodPut, "/open-apis/im/v1/messages/om_new_2", "post", "second **frame**"},
+					{http.MethodPut, "/open-apis/im/v1/messages/om_new_2", "post", "final **answer**\n\nstatus footer"},
+				}
+				if len(requests) != len(wants) {
+					t.Fatalf("requests = %#v, want %d requests", requests, len(wants))
+				}
+				for i, want := range wants {
+					got := requests[i]
+					if got.method != want.method || got.path != want.path || got.msgType != want.msgType {
+						t.Fatalf("request %d = %#v, want %#v", i, got, want)
+					}
+					var text string
+					if got.msgType == "text" {
+						var body map[string]string
+						if err := json.Unmarshal([]byte(got.content), &body); err != nil {
+							t.Fatal(err)
+						}
+						text = body["text"]
+					} else {
+						text = postMarkdownText(t, got.content)
+					}
+					if text != want.text {
+						t.Fatalf("request %d text = %q, want %q", i, text, want.text)
+					}
+				}
+			})
+		}
+	}
 }
 
 func TestLegacyOrdinaryModeKeepsMarkdownCardBehavior(t *testing.T) {
@@ -254,7 +326,7 @@ func TestLegacyOrdinaryModeKeepsMarkdownCardBehavior(t *testing.T) {
 	}
 }
 
-func TestHermesOrdinaryReplyUsesTextForPlainAndPostMDForMarkdown(t *testing.T) {
+func TestPlainOrdinaryReplyUsesTextForPlainAndPostMDForMarkdown(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, true, recorder)
 	defer closeServer()
@@ -282,7 +354,7 @@ func TestHermesOrdinaryReplyUsesTextForPlainAndPostMDForMarkdown(t *testing.T) {
 	}
 }
 
-func TestHermesOrdinaryDirectReplyUploadsRemoteImages(t *testing.T) {
+func TestPlainOrdinaryDirectReplyUploadsRemoteImages(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, true, recorder)
 	defer closeServer()
@@ -310,7 +382,7 @@ func TestHermesOrdinaryDirectReplyUploadsRemoteImages(t *testing.T) {
 	}
 }
 
-func TestHermesOrdinaryDirectPostUsesCompleteByteSafeChunks(t *testing.T) {
+func TestPlainOrdinaryDirectPostUsesCompleteByteSafeChunks(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, true, recorder)
 	defer closeServer()
@@ -343,7 +415,7 @@ func TestHermesOrdinaryDirectPostUsesCompleteByteSafeChunks(t *testing.T) {
 	}
 }
 
-func TestHermesOrdinaryDirectPostDowngradesOnlyExplicitContentErrors(t *testing.T) {
+func TestPlainOrdinaryDirectPostDowngradesOnlyExplicitContentErrors(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		code         int
@@ -377,7 +449,7 @@ func TestHermesOrdinaryDirectPostDowngradesOnlyExplicitContentErrors(t *testing.
 	}
 }
 
-func TestHermesOrdinaryPreviewStartsAsPostAndUsesPUT(t *testing.T) {
+func TestPlainOrdinaryPreviewStartsAsPostAndUsesPUT(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, true, recorder)
 	defer closeServer()
@@ -412,7 +484,7 @@ func TestHermesOrdinaryPreviewStartsAsPostAndUsesPUT(t *testing.T) {
 	}
 }
 
-func TestHermesOrdinaryTableFreezesAfterPrefixAndFinalizesInOriginalPost(t *testing.T) {
+func TestPlainOrdinaryTableFreezesAfterPrefixAndFinalizesInOriginalPost(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, true, recorder)
 	defer closeServer()
@@ -462,7 +534,7 @@ func TestHermesOrdinaryTableFreezesAfterPrefixAndFinalizesInOriginalPost(t *test
 	}
 }
 
-func TestHermesOrdinaryTableInFirstFrameUsesPlaceholderThenFinalPUT(t *testing.T) {
+func TestPlainOrdinaryTableInFirstFrameUsesPlaceholderThenFinalPUT(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, true, recorder)
 	defer closeServer()
@@ -508,7 +580,7 @@ func TestHermesOrdinaryTableInFirstFrameUsesPlaceholderThenFinalPUT(t *testing.T
 	}
 }
 
-func TestHermesOrdinaryPOSTRequestUUIDIsPresentAndStableAcrossRetry(t *testing.T) {
+func TestPlainOrdinaryPOSTRequestUUIDIsPresentAndStableAcrossRetry(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		preview bool
@@ -562,7 +634,7 @@ func TestHermesOrdinaryPOSTRequestUUIDIsPresentAndStableAcrossRetry(t *testing.T
 	}
 }
 
-func TestHermesOrdinaryPreviewReservesTwentiethPUTForFinalize(t *testing.T) {
+func TestPlainOrdinaryPreviewReservesTwentiethPUTForFinalize(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, true, recorder)
 	defer closeServer()
@@ -600,7 +672,7 @@ func TestHermesOrdinaryPreviewReservesTwentiethPUTForFinalize(t *testing.T) {
 	}
 }
 
-func TestHermesOrdinaryFinalizePUTFailureFallsBackOnceWithOriginalReplyContext(t *testing.T) {
+func TestPlainOrdinaryFinalizePUTFailureFallsBackOnceWithOriginalReplyContext(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{putCode: 230001}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, false, recorder)
 	defer closeServer()
@@ -663,7 +735,7 @@ func TestHermesOrdinaryFinalizePUTFailureFallsBackOnceWithOriginalReplyContext(t
 	}
 }
 
-func TestHermesOrdinaryFallbackFailurePreservesPreviewAndReportsUnhandled(t *testing.T) {
+func TestPlainOrdinaryFallbackFailurePreservesPreviewAndReportsUnhandled(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{putCode: 230001, postCode: 230001, postMsg: "send too fast, please retry later"}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, true, recorder)
 	defer closeServer()
@@ -694,7 +766,7 @@ func TestHermesOrdinaryFallbackFailurePreservesPreviewAndReportsUnhandled(t *tes
 	}
 }
 
-func TestHermesOrdinaryFallbackSecondChunkFailureCleansNewChunkAndPreservesPreview(t *testing.T) {
+func TestPlainOrdinaryFallbackSecondChunkFailureCleansNewChunkAndPreservesPreview(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{putCode: 230001, postFailureAt: 2}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, true, recorder)
 	defer closeServer()
@@ -729,7 +801,7 @@ func TestHermesOrdinaryFallbackSecondChunkFailureCleansNewChunkAndPreservesPrevi
 	}
 }
 
-func TestHermesOrdinaryOverflowSecondChunkFailureCleansOverflowAndKeepsUpdatedPreview(t *testing.T) {
+func TestPlainOrdinaryOverflowSecondChunkFailureCleansOverflowAndKeepsUpdatedPreview(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{postFailureAt: 2}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, true, recorder)
 	defer closeServer()
@@ -766,7 +838,7 @@ func TestHermesOrdinaryOverflowSecondChunkFailureCleansOverflowAndKeepsUpdatedPr
 	}
 }
 
-func TestHermesOrdinaryFooterAndStatusStayNonCard(t *testing.T) {
+func TestPlainOrdinaryFooterAndStatusStayNonCard(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, false, recorder)
 	defer closeServer()
@@ -818,7 +890,7 @@ func TestIsHermesCardJSONRequiresCard2BodyElementsStructure(t *testing.T) {
 	}
 }
 
-func TestHermesOrdinaryJSONLookalikeIsNotSentInteractive(t *testing.T) {
+func TestPlainOrdinaryJSONLookalikeIsNotSentInteractive(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, true, recorder)
 	defer closeServer()
@@ -833,7 +905,7 @@ func TestHermesOrdinaryJSONLookalikeIsNotSentInteractive(t *testing.T) {
 	}
 }
 
-func TestHermesCardsDisabledRichCardUsesReadableOrdinaryPost(t *testing.T) {
+func TestPlainCardsDisabledRichCardUsesReadableOrdinaryPost(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, false, recorder)
 	defer closeServer()
@@ -861,7 +933,7 @@ func TestHermesCardsDisabledRichCardUsesReadableOrdinaryPost(t *testing.T) {
 	}
 }
 
-func TestHermesCardsDisabledCardWithoutMarkdownPreservesRawContentAsText(t *testing.T) {
+func TestPlainCardsDisabledCardWithoutMarkdownPreservesRawContentAsText(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, false, recorder)
 	defer closeServer()
@@ -879,7 +951,7 @@ func TestHermesCardsDisabledCardWithoutMarkdownPreservesRawContentAsText(t *test
 	}
 }
 
-func TestHermesCardsDisabledProgressPayloadUsesReadableOrdinaryMessage(t *testing.T) {
+func TestPlainCardsDisabledProgressPayloadUsesReadableOrdinaryMessage(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, false, recorder)
 	defer closeServer()
@@ -903,7 +975,7 @@ func TestHermesCardsDisabledProgressPayloadUsesReadableOrdinaryMessage(t *testin
 	}
 }
 
-func TestHermesPrebuiltRichPreviewKeepsCardKitPath(t *testing.T) {
+func TestPlainPrebuiltRichPreviewKeepsCardKitPath(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, true, recorder)
 	defer closeServer()
@@ -941,7 +1013,7 @@ func TestHermesPrebuiltRichPreviewKeepsCardKitPath(t *testing.T) {
 	}
 }
 
-func TestHermesInteractivePreviewStillUsesCardPath(t *testing.T) {
+func TestPlainInteractivePreviewStillUsesCardPath(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, true, recorder)
 	defer closeServer()
@@ -1014,7 +1086,7 @@ func textMessageText(t *testing.T, content string) string {
 	return body["text"]
 }
 
-func TestHermesOrdinaryResolvedMentionFinalUsesFixedTextChunksThenDeletesPostPreview(t *testing.T) {
+func TestPlainOrdinaryResolvedMentionFinalUsesFixedTextChunksThenDeletesPostPreview(t *testing.T) {
 	for _, tc := range []struct {
 		name            string
 		noReply         bool
@@ -1085,7 +1157,7 @@ func TestHermesOrdinaryResolvedMentionFinalUsesFixedTextChunksThenDeletesPostPre
 	}
 }
 
-func TestHermesOrdinaryMentionTagsStayAtomicAtChunkBoundary(t *testing.T) {
+func TestPlainOrdinaryMentionTagsStayAtomicAtChunkBoundary(t *testing.T) {
 	for _, tag := range []string{
 		`<at user_id="ou_alice">Alice</at>`,
 		`<at id=all>everyone</at>`,
@@ -1131,7 +1203,7 @@ func TestHermesOrdinaryMentionTagsStayAtomicAtChunkBoundary(t *testing.T) {
 	}
 }
 
-func TestHermesOrdinaryResolvedMentionFailurePreservesPostPreview(t *testing.T) {
+func TestPlainOrdinaryResolvedMentionFailurePreservesPostPreview(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{textCode: 230001, textMsg: "send too fast, please retry later"}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, true, recorder)
 	defer closeServer()
@@ -1157,7 +1229,7 @@ func TestHermesOrdinaryResolvedMentionFailurePreservesPostPreview(t *testing.T) 
 	}
 }
 
-func TestHermesOrdinaryMentionSecondChunkFailureCleansNewChunkAndPreservesPreview(t *testing.T) {
+func TestPlainOrdinaryMentionSecondChunkFailureCleansNewChunkAndPreservesPreview(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{textFailureAt: 2}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, true, recorder)
 	defer closeServer()
@@ -1196,7 +1268,7 @@ func TestHermesOrdinaryMentionSecondChunkFailureCleansNewChunkAndPreservesPrevie
 	}
 }
 
-func TestHermesOrdinaryFinalChunksUseSerializedByteLimitsAndFooterOnlyOnLast(t *testing.T) {
+func TestPlainOrdinaryFinalChunksUseSerializedByteLimitsAndFooterOnlyOnLast(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, true, recorder)
 	defer closeServer()
@@ -1252,7 +1324,7 @@ func TestHermesOrdinaryFinalChunksUseSerializedByteLimitsAndFooterOnlyOnLast(t *
 	}
 }
 
-func TestHermesOrdinaryFinalOverflowPreservesReplyAndNoReplySemantics(t *testing.T) {
+func TestPlainOrdinaryFinalOverflowPreservesReplyAndNoReplySemantics(t *testing.T) {
 	for _, tc := range []struct {
 		name            string
 		noReply         bool
@@ -1301,7 +1373,7 @@ func TestHermesOrdinaryFinalOverflowPreservesReplyAndNoReplySemantics(t *testing
 	}
 }
 
-func TestHermesOrdinaryExhaustedTwentiethPUTUsesCompleteFallback(t *testing.T) {
+func TestPlainOrdinaryExhaustedTwentiethPUTUsesCompleteFallback(t *testing.T) {
 	recorder := &ordinaryMessageRecorder{}
 	p, closeServer := newOrdinaryMessageTestPlatform(t, true, recorder)
 	defer closeServer()
@@ -1359,7 +1431,7 @@ func TestBuildOrdinaryPostJSONSplitsFencedCodeIntoMultipleRows(t *testing.T) {
 	}
 }
 
-func TestHermesOrdinaryFinalRemoteImagesUseRowsAndVisibleFallbacks(t *testing.T) {
+func TestPlainOrdinaryFinalRemoteImagesUseRowsAndVisibleFallbacks(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		upload       func(context.Context, string) (string, error)
@@ -1439,7 +1511,7 @@ func TestHermesOrdinaryFinalRemoteImagesUseRowsAndVisibleFallbacks(t *testing.T)
 	}
 }
 
-func TestHermesOrdinaryIntermediateImagesDoNotWaitAndFinalCapsOccurrencesWithDedupedUploads(t *testing.T) {
+func TestPlainOrdinaryIntermediateImagesDoNotWaitAndFinalCapsOccurrencesWithDedupedUploads(t *testing.T) {
 	p := &Platform{platformName: "feishu"}
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -1515,7 +1587,7 @@ func TestHermesOrdinaryIntermediateImagesDoNotWaitAndFinalCapsOccurrencesWithDed
 	}
 }
 
-func TestHermesOrdinaryInvalidPostDowngradesButGenericErrorDoesNot(t *testing.T) {
+func TestPlainOrdinaryInvalidPostDowngradesButGenericErrorDoesNot(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		postMsg      string
@@ -1561,7 +1633,7 @@ func TestHermesOrdinaryInvalidPostDowngradesButGenericErrorDoesNot(t *testing.T)
 	}
 }
 
-func TestHermesOrdinaryConcurrentFinalizeSendsOnlyOnce(t *testing.T) {
+func TestPlainOrdinaryConcurrentFinalizeSendsOnlyOnce(t *testing.T) {
 	gate := make(chan struct{})
 	started := make(chan struct{})
 	recorder := &ordinaryMessageRecorder{putGate: gate, putStarted: started}

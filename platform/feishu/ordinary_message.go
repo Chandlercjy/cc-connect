@@ -20,7 +20,7 @@ import (
 
 const (
 	ordinaryMessageModeLegacy = "legacy"
-	ordinaryMessageModeHermes = "hermes"
+	ordinaryMessageModePlain  = "plain"
 
 	ordinaryPreviewIntermediatePUTLimit = 19
 	ordinaryPreviewTotalPUTLimit        = 20
@@ -100,8 +100,8 @@ func isInvalidPostContentError(err error) bool {
 			(strings.Contains(msg, "invalid") || strings.Contains(msg, "incorrect")))
 }
 
-func (p *Platform) hermesOrdinaryMessagesEnabled() bool {
-	return p.ordinaryMessageMode == ordinaryMessageModeHermes
+func (p *Platform) plainOrdinaryMessagesEnabled() bool {
+	return p.ordinaryMessageMode == ordinaryMessageModePlain
 }
 
 func hermesInteractiveMessageBody(content string) (string, bool) {
@@ -204,7 +204,7 @@ func buildOrdinaryMessageContent(content string, forcePost bool) (msgType, body 
 	return larkim.MsgTypePost, buildPostMdJSON(content)
 }
 
-func (p *Platform) sendHermesMessage(ctx context.Context, rc replyContext, content string) error {
+func (p *Platform) sendPlainMessage(ctx context.Context, rc replyContext, content string) error {
 	if interactiveBody, ok := hermesInteractiveMessageBody(content); ok {
 		if p.useInteractiveCard {
 			if p.shouldUseThreadOrReplyAPI(rc) {
@@ -226,7 +226,7 @@ func (p *Platform) sendHermesMessage(ctx context.Context, rc replyContext, conte
 	prepared, images := p.prepareOrdinaryPostContent(ctx, content, true)
 	chunks, err := p.buildOrdinaryFinalChunks(rc, prepared, "", images)
 	if err != nil {
-		return fmt.Errorf("%s: build Hermes ordinary post chunks: %w", p.tag(), err)
+		return fmt.Errorf("%s: build plain ordinary post chunks: %w", p.tag(), err)
 	}
 	_, err = p.sendOrdinaryPostChunks(ctx, rc, chunks)
 	return err
@@ -715,7 +715,7 @@ func (p *Platform) buildOrdinaryFinalChunks(rc replyContext, text, footer string
 	return chunks, nil
 }
 
-// FinalizePreview implements core.PreviewFinalizer for Hermes ordinary
+// FinalizePreview implements core.PreviewFinalizer for plain ordinary
 // messages. One goroutine owns final delivery; concurrent and repeated calls
 // observe that result rather than issuing duplicate PUT/POST requests. handled
 // is true only after the complete final response has been delivered.

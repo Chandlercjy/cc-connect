@@ -118,7 +118,7 @@ func TestNew_ProgressStyleRejectsInvalidValue(t *testing.T) {
 	}
 }
 
-func TestNew_OrdinaryMessageModeDefaultsLegacyAndAcceptsHermes(t *testing.T) {
+func TestNew_OrdinaryMessageModeDefaultsLegacyAndAcceptsPlain(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		opts map[string]any
@@ -130,9 +130,19 @@ func TestNew_OrdinaryMessageModeDefaultsLegacyAndAcceptsHermes(t *testing.T) {
 			want: "legacy",
 		},
 		{
-			name: "hermes normalized",
-			opts: map[string]any{"app_id": "cli_xxx", "app_secret": "secret", "ordinary_message_mode": " HERMES "},
-			want: "hermes",
+			name: "legacy normalized",
+			opts: map[string]any{"app_id": "cli_xxx", "app_secret": "secret", "ordinary_message_mode": " LEGACY "},
+			want: "legacy",
+		},
+		{
+			name: "plain",
+			opts: map[string]any{"app_id": "cli_xxx", "app_secret": "secret", "ordinary_message_mode": "plain"},
+			want: "plain",
+		},
+		{
+			name: "plain normalized",
+			opts: map[string]any{"app_id": "cli_xxx", "app_secret": "secret", "ordinary_message_mode": " PLAIN "},
+			want: "plain",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -152,7 +162,7 @@ func TestNew_OrdinaryMessageModeDefaultsLegacyAndAcceptsHermes(t *testing.T) {
 }
 
 func TestNew_OrdinaryMessageModeRejectsInvalidValue(t *testing.T) {
-	for _, value := range []any{"", "future", 1} {
+	for _, value := range []any{"hermes", " HERMES ", "", " \t ", "future", 1} {
 		_, err := New(map[string]any{
 			"app_id":                "cli_xxx",
 			"app_secret":            "secret",
@@ -161,8 +171,10 @@ func TestNew_OrdinaryMessageModeRejectsInvalidValue(t *testing.T) {
 		if err == nil {
 			t.Fatalf("expected error for invalid ordinary_message_mode %v", value)
 		}
-		if !strings.Contains(err.Error(), "invalid ordinary_message_mode") {
-			t.Fatalf("error = %q, want invalid ordinary_message_mode", err.Error())
+		for _, want := range []string{"invalid ordinary_message_mode", "want legacy or plain"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("error = %q, want %q", err.Error(), want)
+			}
 		}
 	}
 }

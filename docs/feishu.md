@@ -108,8 +108,8 @@ type = "feishu"
 app_id = "cli_axxxxxxxxxxxx"
 app_secret = "QhkMpxxxxxxxxxxxxxxxxxxxx"
 # domain = "https://open.feishu.cn" # 可选：覆盖运行时 API/WebSocket 域名
-# enable_feishu_card = true  # 可选：控制交互卡片能力；Hermes 普通 text/post 不依赖此开关
-# ordinary_message_mode = "legacy"  # 可选：legacy | hermes；默认 legacy
+# enable_feishu_card = true  # 可选：控制交互卡片能力；plain 普通 text/post 不依赖此开关
+# ordinary_message_mode = "legacy"  # 可选：legacy | plain；默认 legacy
 # thread_isolation = true    # 可选：按飞书 thread/root 隔离群聊会话
 # group_chat_history_share = false  # 可选：共享未 @ 机器人的群消息作为下一次触发的上下文；消息本身不会触发回复
 # progress_style = "legacy"  # 可选：legacy | compact | card
@@ -117,10 +117,11 @@ app_secret = "QhkMpxxxxxxxxxxxxxxxxxxxx"
 # image_batch_window_ms = 500  # 可选：连续多图合批窗口（默认 500ms，详见下文）
 ```
 
-> `ordinary_message_mode = "legacy"` 保持原有行为：普通 Markdown 回复优先使用交互卡片。设置为 `"hermes"` 后，普通 AI 回复改用飞书 `text/post` 消息，流式预览固定为 `post` 并通过消息 PUT 原地更新；每条消息最多使用 19 次中间更新，并保留第 20 次用于最终内容。长回复会按请求字节上限安全分块。
-> Hermes 模式只改变普通回复。权限确认、AskUserQuestion、选择器、表单、Cron/Timer/Heartbeat 控件和 Help 导航等功能型消息仍保留交互卡片；显式 `progress_style = "card"` 与 `card_mode = "rich"` 也继续走卡片路径。含真实 @mention 的最终回复会使用 `text` 发送，以确保飞书触发通知。
+> `ordinary_message_mode = "legacy"` 保持原有行为：普通 Markdown 回复优先使用交互卡片。设置为 `"plain"` 后，普通 AI 回复改用飞书 `text/post` 消息，流式预览固定为 `post` 并通过消息 PUT 原地更新；每条消息最多使用 19 次中间更新，并保留第 20 次用于最终内容。长回复会按请求字节上限安全分块。
+> 正式配置值为 `legacy` / `plain`；旧值 `hermes` 不再接受，使用旧值会在启动校验时失败。配置值忽略大小写和前后空白，但 `HERMES` 等变体同样无效。升级前须将旧配置改为 `plain`，并同步切换支持新名称的二进制；不要用旧配置启动新版本。
+> plain 模式只改变普通回复。权限确认、AskUserQuestion、选择器、表单、Cron/Timer/Heartbeat 控件和 Help 导航等功能型消息仍保留交互卡片；显式 `progress_style = "card"` 与 `card_mode = "rich"` 也继续走卡片路径。含真实 @mention 的最终回复会使用 `text` 发送，以确保飞书触发通知。
 > 如需立即回滚，只需删除该配置或改回 `ordinary_message_mode = "legacy"`，无需迁移数据。
-> 如果应用没有交互卡片权限，或后台未配置卡片回调，可将 `enable_feishu_card = false` 关闭由 CardSender 暴露的交互能力；Hermes 下的显式 card/rich 内容会回退为可读普通消息。Hermes 普通 `text/post` 回复不依赖交互卡片权限，但需要按钮/选择器/表单的功能仍应保留相应权限和回调。
+> 如果应用没有交互卡片权限，或后台未配置卡片回调，可将 `enable_feishu_card = false` 关闭由 CardSender 暴露的交互能力；plain 下的显式 card/rich 内容会回退为可读普通消息。plain 普通 `text/post` 回复不依赖交互卡片权限，但需要按钮/选择器/表单的功能仍应保留相应权限和回调。
 > 如果开启 `thread_isolation = true`，群聊里每个根消息 / reply thread 会对应一个独立 agent session；私聊行为保持原样。
 > `group_chat_history_share = true` 时，cc-connect 只在内存中保留当前进程观察到的、允许访问的群聊 text/post 消息，并在下一次明确 @ 机器人且真正进入 agent turn 时注入；未 @ 的消息不会触发回复。`/status` 等由 cc-connect 处理的命令不会消费这段待处理上下文，`/new` 会清空对应主频道或话题的上下文。
 > 在 multi-workspace 模式下，`thread_isolation = true` 也会让每个话题独立绑定 workspace；在话题内执行 `/workspace bind <name>` 不会影响同群的其他话题。已有的群级 binding 会保留为默认值，由尚未显式绑定的话题继承，因此回退到旧版本时仍可使用。
