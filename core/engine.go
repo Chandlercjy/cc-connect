@@ -483,6 +483,9 @@ type Engine struct {
 	platformLifecycleMu sync.Mutex
 	platformReady       map[Platform]bool
 	stopping            bool
+	ownedWorkers        sync.WaitGroup
+	stopOnce            sync.Once
+	stopErr             error
 	replyFooterMu       sync.Mutex
 	replyFooterUsage    replyFooterUsageCache
 
@@ -1460,6 +1463,10 @@ func (e *Engine) ActiveSessionKeys() []string {
 // It finds the platform that owns the session key, reconstructs a reply context,
 // and processes the message as if the user sent it.
 func (e *Engine) ExecuteCronJob(job *CronJob) error {
+	if !e.beginOwnedWork() {
+		return context.Canceled
+	}
+	defer e.ownedWorkers.Done()
 	e.hooks.Emit(HookEvent{
 		Event:      HookEventCronTriggered,
 		SessionKey: job.SessionKey,
@@ -1668,6 +1675,10 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 // notification (unless muted), and either runs a shell command or injects a
 // synthetic message into the agent session.
 func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
+	if !e.beginOwnedWork() {
+		return context.Canceled
+	}
+	defer e.ownedWorkers.Done()
 	e.hooks.Emit(HookEvent{
 		Event:      HookEventTimerTriggered,
 		SessionKey: job.SessionKey,
@@ -2247,6 +2258,10 @@ func (e *Engine) finishCronShell(p Platform, replyCtx any, cmd *exec.Cmd, mu *sy
 // ExecuteHeartbeat runs a heartbeat check by injecting a synthetic message
 // into the main session, similar to cron but designed for periodic awareness.
 func (e *Engine) ExecuteHeartbeat(sessionKey, prompt string, silent bool) error {
+	if !e.beginOwnedWork() {
+		return context.Canceled
+	}
+	defer e.ownedWorkers.Done()
 	platformName := ""
 	if idx := strings.Index(sessionKey, ":"); idx > 0 {
 		platformName = sessionKey[:idx]
@@ -2353,7 +2368,42 @@ func (e *Engine) Start() error {
 	return nil
 }
 
+// beginOwnedWork registers before any engine-owned persistence. Registration
+// and closing admission share a lock, so no positive Add can race a zero-count
+// Wait. Async bodies that start too late must return without writing state.
+func (e *Engine) beginOwnedWork() bool {
+	e.platformLifecycleMu.Lock()
+	defer e.platformLifecycleMu.Unlock()
+	if e.stopping || (e.ctx != nil && e.ctx.Err() != nil) {
+		return false
+	}
+	e.ownedWorkers.Add(1)
+	return true
+}
+
+// goOwnedWork transfers ownership before launching, including the scheduling
+// gap. Rejection runs cleanup synchronously (notably session.Unlock/Close).
+func (e *Engine) goOwnedWork(run, reject func()) {
+	if !e.beginOwnedWork() {
+		if reject != nil {
+			reject()
+		}
+		return
+	}
+	go func() {
+		defer e.ownedWorkers.Done()
+		run()
+	}()
+}
+
+// Stop is a supervisor operation, never called by owned workers. In-engine
+// restart commands signal RestartCh instead, avoiding a worker waiting on itself.
 func (e *Engine) Stop() error {
+	e.stopOnce.Do(func() { e.stopErr = e.stop() })
+	return e.stopErr
+}
+
+func (e *Engine) stop() error {
 	e.platformLifecycleMu.Lock()
 	e.stopping = true
 	e.platformLifecycleMu.Unlock()
@@ -2370,6 +2420,24 @@ func (e *Engine) Stop() error {
 	for _, p := range e.platforms {
 		if err := p.Stop(); err != nil {
 			errs = append(errs, fmt.Errorf("stop platform %s: %w", p.Name(), err))
+		}
+	}
+
+	// StartSession may hold interactiveMu while waiting on the adapter. Stop
+	// agents first to unblock startup/Send, then collect and close live sessions.
+	if err := e.agent.Stop(); err != nil {
+		errs = append(errs, fmt.Errorf("stop agent %s: %w", e.agent.Name(), err))
+	}
+	if e.workspacePool != nil {
+		for _, ws := range e.workspacePool.All() {
+			ws.mu.Lock()
+			agent := ws.agent
+			ws.mu.Unlock()
+			if agent != nil && agent != e.agent {
+				if err := agent.Stop(); err != nil {
+					errs = append(errs, fmt.Errorf("stop workspace agent %s: %w", agent.Name(), err))
+				}
+			}
 		}
 	}
 
@@ -2397,9 +2465,9 @@ func (e *Engine) Stop() error {
 	}
 	e.userRolesMu.Unlock()
 
-	if err := e.agent.Stop(); err != nil {
-		errs = append(errs, fmt.Errorf("stop agent %s: %w", e.agent.Name(), err))
-	}
+	// Cancellation/Close only request exit; completed delivery may still Save.
+	// Never wait under lifecycle, interactive, workspace, or session state locks.
+	e.ownedWorkers.Wait()
 	if len(errs) > 0 {
 		return fmt.Errorf("engine stop errors: %v", errs)
 	}
@@ -2811,6 +2879,11 @@ func (e *Engine) startMessageRecallMonitor(sessionKey string) context.CancelFunc
 }
 
 func (e *Engine) handleMessage(p Platform, msg *Message) {
+	if !e.beginOwnedWork() {
+		return
+	}
+	defer e.ownedWorkers.Done()
+
 	if msg.Recalled {
 		e.handleMessageRecall(p, msg)
 		return
@@ -3052,7 +3125,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 			// and the queue append. Re-try TryLock — if it succeeds, no one is
 			// draining the queue so we must start a processor ourselves.
 			if session.TryLock() {
-				go e.drainOrphanedQueue(session, sessions, interactiveKey, agent, resolvedWorkspace)
+				e.goOwnedWork(func() {
+					e.drainOrphanedQueue(session, sessions, interactiveKey, agent, resolvedWorkspace)
+				}, session.Unlock)
 			}
 			return
 		}
@@ -3091,7 +3166,9 @@ sessionLocked:
 		"session", session.ID,
 	)
 
-	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey)
+	e.goOwnedWork(func() {
+		e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey)
+	}, session.Unlock)
 }
 
 func runMessageAccepted(msg *Message) {
@@ -3273,6 +3350,11 @@ func (e *Engine) ensureInteractiveStateForQueueing(key string, p Platform, reply
 // to the drain loop in processInteractiveMessageWith but as a standalone
 // goroutine.
 func (e *Engine) drainOrphanedQueue(session *Session, sessions *SessionManager, interactiveKey string, agent Agent, workspaceDir string) {
+	if !e.beginOwnedWork() {
+		session.Unlock()
+		return
+	}
+	defer e.ownedWorkers.Done()
 	unlocked := false
 	defer func() {
 		if !unlocked {
@@ -3782,6 +3864,11 @@ func (e *Engine) processInteractiveMessage(p Platform, msg *Message, session *Se
 // and workspaceDir so that multi-workspace mode can route to per-workspace agents.
 // ccSessionKey, when non-empty, is used for CC_SESSION_KEY in the agent env; otherwise interactiveKey is used.
 func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session *Session, agent Agent, sessions *SessionManager, interactiveKey string, workspaceDir string, ccSessionKey string) {
+	if !e.beginOwnedWork() {
+		session.Unlock()
+		return
+	}
+	defer e.ownedWorkers.Done()
 	// session.Unlock() is NOT deferred here — it is called explicitly in
 	// the drain loop below while holding state.mu to close the race window
 	// between "queue is empty" and "session unlocked". A deferred fallback
@@ -3905,13 +3992,13 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	// Send until the prompt turn finishes (e.g. ACP session/prompt); they may emit
 	// EventPermissionRequest while blocked — the event loop must run in parallel.
 	sendDone := make(chan error, 1)
-	go func() {
+	e.goOwnedWork(func() {
 		if as == nil {
 			sendDone <- fmt.Errorf("agent session became nil")
 			return
 		}
 		sendDone <- as.Send(promptContent, msg.MessageID, msg.Images, msg.Files)
-	}()
+	}, func() { sendDone <- context.Canceled })
 
 	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx)
 	if elapsed := time.Since(sendStart); elapsed >= slowAgentSend {
@@ -4256,6 +4343,12 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 			e.interactiveStates[sessionKey] = state
 			return state
 		}
+	}
+	// A successful adapter return can race cancellation. Do not publish or send
+	// to a session that arrived after Stop began collecting live sessions.
+	if e.ctx.Err() != nil {
+		_ = agentSession.Close()
+		return &interactiveState{platform: p, replyCtx: replyCtx, agent: agent, eventsNeedResync: true}
 	}
 	if startElapsed >= slowAgentStart {
 		slog.Warn("slow agent session start", "elapsed", startElapsed, "agent", agent.Name(), "session_id", startSessionID)
@@ -4792,13 +4885,22 @@ func (e *Engine) startUnsolicitedReader(state *interactiveState, session *Sessio
 	state.unsolicitedDone = done
 	state.mu.Unlock()
 
-	go e.runUnsolicitedReader(ctx, cancel, done, state, agentSession, session, sessions, sessionKey, workspaceDir)
+	e.goOwnedWork(func() {
+		e.runUnsolicitedReader(ctx, cancel, done, state, agentSession, session, sessions, sessionKey, workspaceDir)
+	}, func() { cancel(); close(done) })
 }
 
 // runUnsolicitedReader is the goroutine body for the unsolicited event reader.
 // agentSession is captured by the caller so we don't race with
 // cleanupInteractiveState nilling state.agentSession.
 func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.CancelFunc, done chan struct{}, state *interactiveState, agentSession AgentSession, session *Session, sessions *SessionManager, sessionKey string, workspaceDir string) {
+	// Preserve done/cancel even when shutdown rejects a not-yet-started reader.
+	if !e.beginOwnedWork() {
+		cancel()
+		close(done)
+		return
+	}
+	defer e.ownedWorkers.Done()
 	defer close(done)
 	defer cancel()
 
@@ -5754,7 +5856,15 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				idleTimer.Stop()
 			}
 
-			<-pending.Resolved
+			select {
+			case <-pending.Resolved:
+			case <-e.ctx.Done():
+				// Shutdown cannot wait for a human answer after closing admission.
+				// Selecting here also covers a request published during cancellation.
+				pending.resolve()
+				e.cleanupInteractiveState(sessionKey, state)
+				return
+			}
 			slog.Info("permission resolved", "request_id", event.RequestID)
 
 			// The stream preview was frozen+detached when this permission
@@ -6209,13 +6319,13 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.mu.Unlock()
 
 				nextSend := make(chan error, 1)
-				go func() {
+				e.goOwnedWork(func() {
 					if as == nil {
 						nextSend <- fmt.Errorf("agent session became nil")
 						return
 					}
 					nextSend <- as.Send(queuedPrompt, queued.messageID, queued.images, queued.files)
-				}()
+				}, func() { nextSend <- context.Canceled })
 				pendingSend = nextSend
 
 				// Detect language now (deferred from queue time to avoid
@@ -6537,13 +6647,13 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		session.AddHistory("user", queued.content)
 
 		sendDone := make(chan error, 1)
-		go func() {
+		e.goOwnedWork(func() {
 			if as == nil {
 				sendDone <- fmt.Errorf("agent session became nil")
 				return
 			}
 			sendDone <- as.Send(prompt, queued.messageID, queued.images, queued.files)
-		}()
+		}, func() { sendDone <- context.Canceled })
 
 		var stopTyping func()
 		if ti, ok := queued.platform.(TypingIndicator); ok {
@@ -10522,12 +10632,19 @@ func (e *Engine) cmdCompress(p Platform, msg *Message) {
 
 	e.send(p, msg.ReplyCtx, e.i18n.T(MsgCompressing))
 
-	go e.runCompress(state, session, sessions, iKey, p, msg.ReplyCtx, false)
+	e.goOwnedWork(func() {
+		e.runCompress(state, session, sessions, iKey, p, msg.ReplyCtx, false)
+	}, session.Unlock)
 }
 
 // runCompress sends the agent's compress command and handles results.
 // If autoTriggered is true, suppress user-visible "compressing" and completion messages.
 func (e *Engine) runCompress(state *interactiveState, session *Session, sessions *SessionManager, iKey string, p Platform, replyCtx any, auto bool) {
+	if !e.beginOwnedWork() {
+		session.Unlock()
+		return
+	}
+	defer e.ownedWorkers.Done()
 	// session.Unlock() is called inside drainQueuedMessagesAfterCompress
 	// while holding state.mu to close the race window. Deferred fallback
 	// ensures the lock is released on early-return paths.
@@ -11327,6 +11444,10 @@ type sendTarget struct {
 }
 
 func (e *Engine) SendToSessionInWorkDir(sessionKey, message string, images []ImageAttachment, files []FileAttachment, workDir string, atUsers []string, atAll bool) error {
+	if !e.beginOwnedWork() {
+		return context.Canceled
+	}
+	defer e.ownedWorkers.Done()
 	if message == "" && len(images) == 0 && len(files) == 0 {
 		return fmt.Errorf("message or attachment is required")
 	}
@@ -12294,6 +12415,10 @@ func (e *Engine) sendWithCard(p Platform, replyCtx any, card *Card) {
 // handleCardNav is called by platforms that support in-place card updates.
 // It routes nav: and act: prefixed actions to the appropriate render function.
 func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
+	if !e.beginOwnedWork() {
+		return nil
+	}
+	defer e.ownedWorkers.Done()
 	var prefix, body string
 	if i := strings.Index(action, ":"); i >= 0 {
 		prefix = action[:i]
@@ -12499,7 +12624,9 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		state.mu.Lock()
 		state.modelSwitch = &modelSwitchState{phase: "switching", target: target}
 		state.mu.Unlock()
-		go e.performModelSwitchAsync(sessionKey, state, agent, sessions, target)
+		e.goOwnedWork(func() {
+			e.performModelSwitchAsync(sessionKey, state, agent, sessions, target)
+		}, nil)
 
 	case "/reasoning":
 		if args == "" {
@@ -12956,6 +13083,10 @@ func (e *Engine) renderDeleteModeDeletingCard(dm *deleteModeState) *Card {
 // indicator. Once all deletions finish it updates the interactive state and
 // pushes a result card to the originating platform.
 func (e *Engine) performDeleteModeAsync(sessionKey string, selectedIDs map[string]struct{}) {
+	if !e.beginOwnedWork() {
+		return
+	}
+	defer e.ownedWorkers.Done()
 	lines := e.submitDeleteModeSelection(sessionKey, selectedIDs)
 	result := strings.Join(lines, "\n")
 
@@ -13025,6 +13156,10 @@ func (e *Engine) pushDeleteModeResultCard(sessionKey string) {
 }
 
 func (e *Engine) performModelSwitchAsync(sessionKey string, state *interactiveState, agent Agent, sessions *SessionManager, target string) {
+	if !e.beginOwnedWork() {
+		return
+	}
+	defer e.ownedWorkers.Done()
 	resolved, err := e.switchModelOnAgent(agent, target, agent == e.agent)
 	if err == nil {
 		interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
@@ -13157,7 +13292,7 @@ func (e *Engine) executeDeleteModeAction(sessionKey, args string) {
 		dm.selectedIDs = make(map[string]struct{})
 		dm.phase = "deleting"
 		dm.hint = e.i18n.Tf(MsgDeleteModeDeletingBody, len(ids))
-		go e.performDeleteModeAsync(sessionKey, ids)
+		e.goOwnedWork(func() { e.performDeleteModeAsync(sessionKey, ids) }, nil)
 	case "form-submit":
 		dm.selectedIDs = parseDeleteModeSelectedIDs(fields[1:])
 		if len(dm.selectedIDs) == 0 {
@@ -14938,7 +15073,9 @@ func (e *Engine) executeCustomCommand(p Platform, msg *Message, cmd *CustomComma
 	)
 
 	msg.Content = prompt
-	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey)
+	e.goOwnedWork(func() {
+		e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey)
+	}, session.Unlock)
 }
 
 // executeShellCommand runs a shell command and sends the output to the user.
@@ -15166,7 +15303,9 @@ func (e *Engine) executeSkill(p Platform, msg *Message, skill *Skill, args []str
 	)
 
 	msg.Content = prompt
-	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey)
+	e.goOwnedWork(func() {
+		e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey)
+	}, session.Unlock)
 }
 
 func (e *Engine) cmdSkills(p Platform, msg *Message) {
@@ -16121,6 +16260,10 @@ func (e *Engine) relayContextForSourceSessionKey(fromProject, sourceSessionKey s
 // dedicated relay session, sends the message to the agent, and blocks until
 // the complete response is collected (or the relay context times out).
 func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey, message string) (string, error) {
+	if !e.beginOwnedWork() {
+		return "", context.Canceled
+	}
+	defer e.ownedWorkers.Done()
 	agent, sessions, relaySessionKey, err := e.relayContextForSourceSessionKey(fromProject, sourceSessionKey)
 	if err != nil {
 		return "", err
@@ -16189,7 +16332,18 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 	}
 
 	var textParts []string
-	for event := range agentSession.Events() {
+	for {
+		var event Event
+		var ok bool
+		select {
+		case <-e.ctx.Done():
+			agentSession.Close()
+			return "", e.ctx.Err()
+		case event, ok = <-agentSession.Events():
+		}
+		if !ok {
+			break
+		}
 		switch event.Type {
 		case EventText:
 			if event.Content != "" {
@@ -16242,7 +16396,9 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 			// Relay timed out. Let the agent finish its turn in the
 			// background so the session state is saved cleanly and the
 			// session remains resumable for the next relay call.
-			go e.drainRelaySession(agentSession, session, sessions, agent.Name(), relaySessionKey)
+			e.goOwnedWork(func() {
+				e.drainRelaySession(agentSession, session, sessions, agent.Name(), relaySessionKey)
+			}, func() { _ = agentSession.Close() })
 			return relayPartialResponseOrError(ctx.Err(), textParts, fromProject, e.name)
 		}
 	}
@@ -16280,6 +16436,11 @@ func relayPartialResponseOrError(ctxErr error, textParts []string, fromProject, 
 // auto-approves any permission requests, and then closes the session. A 10-minute
 // safety timeout prevents the goroutine from leaking if the agent hangs.
 func (e *Engine) drainRelaySession(agentSession AgentSession, session *Session, sessions *SessionManager, agentName, relaySessionKey string) {
+	if !e.beginOwnedWork() {
+		agentSession.Close()
+		return
+	}
+	defer e.ownedWorkers.Done()
 	timer := time.NewTimer(10 * time.Minute)
 	defer timer.Stop()
 

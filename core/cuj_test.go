@@ -1191,6 +1191,7 @@ func TestCUJ_A5_FileReachesAgent(t *testing.T) {
 	agent := &cujAgent{}
 	dir := t.TempDir()
 	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
+	t.Cleanup(func() { _ = e.Stop() })
 
 	msg := &Message{
 		SessionKey: "test:file", Platform: "test", MessageID: "f1",
@@ -1206,12 +1207,12 @@ func TestCUJ_A5_FileReachesAgent(t *testing.T) {
 		agent.mu.Lock()
 		n := len(agent.sessions)
 		agent.mu.Unlock()
-		if n > 0 {
+		if n > 0 && strings.Contains(strings.Join(plat.getSent(), "\n"), "ok") {
 			return
 		}
 		select {
 		case <-deadline:
-			t.Fatal("agent never received the message with file attachment")
+			t.Fatal("file message never reached user-visible agent completion")
 		default:
 			time.Sleep(10 * time.Millisecond)
 		}

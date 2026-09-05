@@ -18,7 +18,9 @@ type sendRecord struct {
 }
 
 type recordingAgent struct {
-	session *recordingSession
+	mu       sync.Mutex
+	session  *recordingSession // first session, for single-session fixture controls
+	sessions []*recordingSession
 }
 
 func newRecordingAgent() *recordingAgent {
@@ -28,8 +30,15 @@ func newRecordingAgent() *recordingAgent {
 func (a *recordingAgent) Name() string { return "recording-agent" }
 
 func (a *recordingAgent) StartSession(_ context.Context, sessionID string) (core.AgentSession, error) {
-	a.session.setID(sessionID)
-	return a.session, nil
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	session := a.session
+	if len(a.sessions) > 0 {
+		session = newRecordingSession()
+	}
+	session.setID(sessionID)
+	a.sessions = append(a.sessions, session)
+	return session, nil
 }
 
 func (a *recordingAgent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error) {
@@ -37,7 +46,12 @@ func (a *recordingAgent) ListSessions(_ context.Context) ([]core.AgentSessionInf
 }
 
 func (a *recordingAgent) Stop() error {
-	return a.session.Close()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, session := range a.sessions {
+		_ = session.Close()
+	}
+	return nil
 }
 
 type recordingSession struct {
@@ -411,7 +425,7 @@ func TestSendToSessionWithAttachmentsRespectsDisabledAttachmentSend(t *testing.T
 }
 
 func TestSendToSessionWithAttachmentsRequiresSessionWhenMultipleSessionsHaveAttachments(t *testing.T) {
-	engine, agent, platform := newMediaEngine(t)
+	engine, _, platform := newMediaEngine(t)
 	first := mediaMessage("first")
 	first.SessionKey = "media:chat-1:user-1"
 	second := mediaMessage("second")
@@ -420,8 +434,26 @@ func TestSendToSessionWithAttachmentsRequiresSessionWhenMultipleSessionsHaveAtta
 
 	engine.ReceiveMessage(platform, first)
 	engine.ReceiveMessage(platform, second)
-	agent.session.waitRecords(t, 2)
-	platform.waitTextContaining(t, "media ok")
+	// Two distinct sessions must each deliver their result. A shared event
+	// channel lets one foreground/unsolicited reader steal the other turn.
+	deadline := time.After(2 * time.Second)
+	for {
+		texts, _, _, _, contexts := platform.snapshot()
+		completed := map[any]bool{}
+		for i, text := range texts {
+			if strings.Contains(text, "media ok") {
+				completed[contexts[i]] = true
+			}
+		}
+		if completed[first.ReplyCtx] && completed[second.ReplyCtx] {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("both sessions must finish visibly, got texts=%#v contexts=%#v", texts, contexts)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 
 	err := engine.SendToSessionWithAttachments(
 		"",
